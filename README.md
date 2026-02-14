@@ -1,5 +1,11 @@
 # @mayurbhusare/resilient-queue
 
+![npm version](https://img.shields.io/npm/v/@mayurbhusare/resilient-queue)
+![license](https://img.shields.io/npm/l/@mayurbhusare/resilient-queue)
+![downloads](https://img.shields.io/npm/dt/@mayurbhusare/resilient-queue)
+![node](https://img.shields.io/node/v/@mayurbhusare/resilient-queue)
+
+
 Minimal resilient Redis-backed job queue for Node.js.
 
 Provides exponential retry, dead-letter queue (DLQ) handling, idempotency guarantees, and graceful shutdown — without heavy frameworks.
