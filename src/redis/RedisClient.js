@@ -1,8 +1,14 @@
 const Redis = require("ioredis");
 
 /**
- * Redis client wrapper.
- * Responsible only for managing the Redis connection.
+ * RedisClient
+ *
+ * Creates separate Redis connections for:
+ *  - Producer (writes: RPUSH, SET, etc.)
+ *  - Consumer (blocking reads: BLPOP)
+ *
+ * This separation is critical because a connection
+ * blocked by BLPOP cannot execute other commands.
  */
 class RedisClient {
   constructor(redisUrl) {
@@ -10,20 +16,51 @@ class RedisClient {
       throw new Error("redisUrl is required to initialize RedisClient");
     }
 
-    this.redis = new Redis(redisUrl);
-
-    this.redis.on("connect", () => {
-      // Silent by default — no noisy logs in library
+    // Producer connection (writes)
+    this.producer = new Redis(redisUrl, {
+      maxRetriesPerRequest: null
     });
 
-    this.redis.on("error", (err) => {
-      // Do not crash application
-      console.error("[resilient-queue] Redis connection error:", err.message);
+    // Consumer connection (blocking reads)
+    this.consumer = new Redis(redisUrl, {
+      maxRetriesPerRequest: null
     });
+
+    this._attachEventHandlers();
   }
 
-  getClient() {
-    return this.redis;
+  /**
+   * Attach safe error handlers.
+   * Library should not log by default.
+   * Host application can manage Redis errors.
+   */
+  _attachEventHandlers() {
+    this.producer.on("error", () => {});
+    this.consumer.on("error", () => {});
+  }
+
+  /**
+   * Returns producer connection.
+   */
+  getProducer() {
+    return this.producer;
+  }
+
+  /**
+   * Returns consumer connection.
+   */
+  getConsumer() {
+    return this.consumer;
+  }
+
+  /**
+   * Gracefully close connections.
+   */
+  async disconnect() {
+    await Promise.all([
+      this.producer.quit(),
+      this.consumer.quit()
+    ]);
   }
 }
 

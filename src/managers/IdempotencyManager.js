@@ -17,18 +17,28 @@ class IdempotencyManager {
    */
   async shouldProcess(idempotencyKey, ttlSeconds = null) {
     if (!idempotencyKey) {
-      return true; // No idempotency enforcement
+      return true;
     }
 
     const redisKey = `${this.keyPrefix}:idempotency:${idempotencyKey}`;
 
-    const result = await this.redis.set(
-      redisKey,
-      "1",
-      ttlSeconds ? "EX" : undefined,
-      ttlSeconds || undefined,
-      "NX"
-    );
+    let result;
+
+    if (ttlSeconds) {
+      result = await this.redis.set(
+        redisKey,
+        "1",
+        "EX",
+        ttlSeconds,
+        "NX"
+      );
+    } else {
+      result = await this.redis.set(
+        redisKey,
+        "1",
+        "NX"
+      );
+    }
 
     return result === "OK";
   }

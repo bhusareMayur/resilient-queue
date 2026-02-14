@@ -21,10 +21,13 @@ class RetryManager {
     this.keyPrefix = options.keyPrefix ?? "rq";
   }
 
+  /**
+   * Handle job failure and decide whether to retry or send to DLQ.
+   */
   async handleFailure(job, error) {
     const mainQueueKey = `${this.keyPrefix}:main`;
 
-    // If not retryable → send to DLQ immediately
+    // If error is not retryable → send to DLQ immediately
     if (!(error instanceof RetryableError)) {
       await this.dlqManager.moveToDLQ(job, error);
       return;
@@ -32,7 +35,7 @@ class RetryManager {
 
     const nextAttempt = (job.attempt || 0) + 1;
 
-    // If max retries exceeded → DLQ
+    // If max retries exceeded → send to DLQ
     if (nextAttempt > this.maxRetries) {
       await this.dlqManager.moveToDLQ(
         { ...job, attempt: nextAttempt },
@@ -50,14 +53,14 @@ class RetryManager {
       retriedAt: Date.now()
     };
 
-    // Delay requeue using setTimeout (v1 simple design)
-    setTimeout(async () => {
-      try {
-        await this.redis.rpush(mainQueueKey, JSON.stringify(retryJob));
-      } catch (err) {
-        // If retry push fails → send to DLQ
-        await this.dlqManager.moveToDLQ(retryJob, err);
-      }
+    // Requeue job after exponential delay
+    setTimeout(() => {
+      this.redis
+        .rpush(mainQueueKey, JSON.stringify(retryJob))
+        .catch(err => {
+          // If requeue fails, move job to DLQ
+          this.dlqManager.moveToDLQ(retryJob, err);
+        });
     }, delay);
   }
 }

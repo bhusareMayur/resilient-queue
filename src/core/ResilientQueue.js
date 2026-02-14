@@ -4,7 +4,6 @@ const RedisClient = require("../redis/RedisClient");
 const IdempotencyManager = require("../managers/IdempotencyManager");
 const DLQManager = require("../managers/DLQManager");
 const RetryManager = require("../managers/RetryManager");
-const { FatalError } = require("../errors/Errors");
 
 /**
  * Main queue class.
@@ -25,21 +24,25 @@ class ResilientQueue {
     this.keyPrefix = keyPrefix;
     this.mainQueueKey = `${keyPrefix}:main`;
 
+    this.isRunning = false;
+
     const redisClientWrapper = new RedisClient(redisUrl);
-    this.redis = redisClientWrapper.getClient();
+
+    this.producer = redisClientWrapper.getProducer();
+    this.consumer = redisClientWrapper.getConsumer();
 
     this.idempotencyManager = new IdempotencyManager(
-      this.redis,
+      this.producer,
       keyPrefix
     );
 
     this.dlqManager = new DLQManager(
-      this.redis,
+      this.producer,
       keyPrefix
     );
 
     this.retryManager = new RetryManager(
-      this.redis,
+      this.producer,
       this.dlqManager,
       { maxRetries, baseDelay, keyPrefix }
     );
@@ -60,7 +63,10 @@ class ResilientQueue {
       createdAt: Date.now()
     };
 
-    await this.redis.rpush(this.mainQueueKey, JSON.stringify(job));
+    await this.producer.rpush(
+      this.mainQueueKey,
+      JSON.stringify(job)
+    );
 
     return job.id;
   }
@@ -73,9 +79,11 @@ class ResilientQueue {
       throw new Error("A handler function must be provided to process()");
     }
 
-    while (true) {
+    this.isRunning = true;
+
+    while (this.isRunning) {
       try {
-        const result = await this.redis.blpop(
+        const result = await this.consumer.blpop(
           this.mainQueueKey,
           0
         );
@@ -89,16 +97,20 @@ class ResilientQueue {
 
         try {
           job = JSON.parse(rawJob);
-        } catch (err) {
-          // Malformed job — skip safely
+        } catch {
           continue;
         }
 
-        const shouldProceed =
-          await this.idempotencyManager.shouldProcess(
-            job.idempotencyKey,
-            job.ttlSeconds
-          );
+        let shouldProceed = true;
+
+        // Apply idempotency only on first attempt
+        if (job.attempt === 0) {
+          shouldProceed =
+            await this.idempotencyManager.shouldProcess(
+              job.idempotencyKey,
+              job.ttlSeconds
+            );
+        }
 
         if (!shouldProceed) {
           continue;
@@ -110,14 +122,29 @@ class ResilientQueue {
           await this.retryManager.handleFailure(job, error);
         }
 
-      } catch (err) {
-        // Safety net — never crash worker
-        console.error(
-          "[resilient-queue] Worker loop error:",
-          err.message
-        );
+      } catch {
+        // Silent safety net
       }
     }
+  }
+
+  /**
+   * Stop the worker loop.
+   */
+  async stop() {
+    this.isRunning = false;
+  }
+
+  /**
+   * Stop worker and close Redis connections.
+   */
+  async close() {
+    this.isRunning = false;
+
+    await Promise.all([
+      this.producer.quit(),
+      this.consumer.quit()
+    ]);
   }
 }
 
