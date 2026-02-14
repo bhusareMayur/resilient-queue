@@ -23,7 +23,6 @@ class ResilientQueue {
 
     this.keyPrefix = keyPrefix;
     this.mainQueueKey = `${keyPrefix}:main`;
-
     this.isRunning = false;
 
     const redisClientWrapper = new RedisClient(redisUrl);
@@ -83,9 +82,10 @@ class ResilientQueue {
 
     while (this.isRunning) {
       try {
+        // IMPORTANT: timeout = 1 (not 0)
         const result = await this.consumer.blpop(
           this.mainQueueKey,
-          0
+          1
         );
 
         if (!result || result.length < 2) {
@@ -119,7 +119,10 @@ class ResilientQueue {
         try {
           await handler(job);
         } catch (error) {
-          await this.retryManager.handleFailure(job, error);
+          // Prevent retry during shutdown
+          if (this.isRunning) {
+            await this.retryManager.handleFailure(job, error);
+          }
         }
 
       } catch {
@@ -136,10 +139,13 @@ class ResilientQueue {
   }
 
   /**
-   * Stop worker and close Redis connections.
+   * Stop worker and close Redis connections safely.
    */
   async close() {
     this.isRunning = false;
+
+    // Wait for BLPOP (timeout 1s) to exit naturally
+    await new Promise(resolve => setTimeout(resolve, 1100));
 
     await Promise.all([
       this.producer.quit(),
