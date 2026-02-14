@@ -2,3 +2,5 @@ tests
 node_modules
 coverage
 .github
+.env
+*.tgz
