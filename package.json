@@ -20,12 +20,12 @@
   "author": "Mayur Bhusare",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/mayurbhusare/resilient-queue.git"
+    "url": "git+https://github.com/bhusareMayur/resilient-queue.git"
   },
   "bugs": {
-    "url": "https://github.com/mayurbhusare/resilient-queue/issues"
+    "url": "https://github.com/bhusareMayur/resilient-queue/issues"
   },
-  "homepage": "https://github.com/mayurbhusare/resilient-queue#readme",
+  "homepage": "https://github.com/bhusareMayur/resilient-queue#readme",
   "scripts": {
     "test": "jest --runInBand"
   },
