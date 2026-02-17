@@ -17,7 +17,7 @@
     "nodejs",
     "backend"
   ],
-  "author": "Mayur Bhusare",
+  "author": "Mayur S. Bhusare",
   "repository": {
     "type": "git",
     "url": "git+https://github.com/bhusareMayur/resilient-queue.git"
