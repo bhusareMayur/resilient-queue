@@ -1,6 +1,6 @@
 {
   "name": "@mayurbhusare/resilient-queue",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "description": "A lightweight Redis-backed job queue with exponential retry, dead-letter queue support, and idempotency guarantees.",
   "main": "src/index.js",
   "type": "commonjs",
