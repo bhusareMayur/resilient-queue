@@ -24,6 +24,7 @@ class ResilientQueue {
     this.keyPrefix = keyPrefix;
     this.mainQueueKey = `${keyPrefix}:main`;
     this.isRunning = false;
+    this.workerCount = 0;
 
     const redisClientWrapper = new RedisClient(redisUrl);
 
@@ -73,61 +74,75 @@ class ResilientQueue {
   /**
    * Start processing jobs.
    */
-  async process(handler) {
+  async process(handler, options = {}) {
     if (typeof handler !== "function") {
       throw new Error("A handler function must be provided to process()");
     }
 
+    const { concurrency = 1 } = options;
+
+    if (concurrency < 1) {
+      throw new Error("Concurrency must be at least 1");
+    }
+
     this.isRunning = true;
+    this.workerCount = concurrency;
 
-    while (this.isRunning) {
-      try {
-        // IMPORTANT: timeout = 1 (not 0)
-        const result = await this.consumer.blpop(
-          this.mainQueueKey,
-          1
-        );
-
-        if (!result || result.length < 2) {
-          continue;
-        }
-
-        const rawJob = result[1];
-        let job;
-
+    const startWorker = async () => {
+      while (this.isRunning) {
         try {
-          job = JSON.parse(rawJob);
-        } catch {
-          continue;
-        }
+          // IMPORTANT: timeout = 1 for graceful shutdown
+          const result = await this.consumer.blpop(
+            this.mainQueueKey,
+            1
+          );
 
-        let shouldProceed = true;
-
-        // Apply idempotency only on first attempt
-        if (job.attempt === 0) {
-          shouldProceed =
-            await this.idempotencyManager.shouldProcess(
-              job.idempotencyKey,
-              job.ttlSeconds
-            );
-        }
-
-        if (!shouldProceed) {
-          continue;
-        }
-
-        try {
-          await handler(job);
-        } catch (error) {
-          // Prevent retry during shutdown
-          if (this.isRunning) {
-            await this.retryManager.handleFailure(job, error);
+          if (!result || result.length < 2) {
+            continue;
           }
-        }
 
-      } catch {
-        // Silent safety net
+          const rawJob = result[1];
+          let job;
+
+          try {
+            job = JSON.parse(rawJob);
+          } catch {
+            continue;
+          }
+
+          let shouldProceed = true;
+
+          // Apply idempotency only on first attempt
+          if (job.attempt === 0) {
+            shouldProceed =
+              await this.idempotencyManager.shouldProcess(
+                job.idempotencyKey,
+                job.ttlSeconds
+              );
+          }
+
+          if (!shouldProceed) {
+            continue;
+          }
+
+          try {
+            await handler(job);
+          } catch (error) {
+            // Prevent retry during shutdown
+            if (this.isRunning) {
+              await this.retryManager.handleFailure(job, error);
+            }
+          }
+
+        } catch {
+          // Silent safety net
+        }
       }
+    };
+
+    // Start worker pool
+    for (let i = 0; i < concurrency; i++) {
+      startWorker();
     }
   }
 
