@@ -1,3 +1,7 @@
+> ⚠ Maintenance Mode  
+> This project is currently in maintenance mode. Contributions are welcome.
+
+
 # @mayurbhusare/resilient-queue
 
 ![npm version](https://img.shields.io/npm/v/@mayurbhusare/resilient-queue)
