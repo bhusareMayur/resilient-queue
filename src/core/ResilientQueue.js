@@ -87,6 +87,7 @@ class ResilientQueue {
 
     this.isRunning = true;
     this.workerCount = concurrency;
+    this.workers = [];
 
     const startWorker = async () => {
       while (this.isRunning) {
@@ -128,13 +129,7 @@ class ResilientQueue {
           try {
             await handler(job);
           } catch (error) {
-            // Prevent retry during shutdown
-            if (this.isRunning) {
               await this.retryManager.handleFailure(job, error);
-            }
-          }
-
-        } catch {
           // Silent safety net
         }
       }
@@ -142,7 +137,7 @@ class ResilientQueue {
 
     // Start worker pool
     for (let i = 0; i < concurrency; i++) {
-      startWorker();
+      this.workers.push(startWorker());
     }
   }
 
@@ -159,8 +154,10 @@ class ResilientQueue {
   async close() {
     this.isRunning = false;
 
-    // Wait for BLPOP (timeout 1s) to exit naturally
-    await new Promise(resolve => setTimeout(resolve, 1100));
+    // Await all active workers to finish their current execution
+    if (this.workers && this.workers.length > 0) {
+      await Promise.all(this.workers);
+    }
 
     await Promise.all([
       this.producer.quit(),
