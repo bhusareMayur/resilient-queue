@@ -35,8 +35,7 @@ npm install @mayurbhusare/resilient-queue
 ```
 
 ## 🚀 Quick Example
-```bash
-
+```js
 const {
   ResilientQueue,
   RetryableError,
@@ -92,7 +91,6 @@ rq:dlq
 ```
 
 ### DLQ entries contain:
-
 - failure reason
 - attempt count
 - timestamps
@@ -100,13 +98,12 @@ rq:dlq
 ## Idempotency
 
 If an `idempotencyKey` is provided:
-
 - First execution succeeds
 - Duplicate submissions are ignored
 - Retries are not blocked
 
 ## Graceful Shutdown
-```bash
+```js
 await queue.close();
 ```
 Safely stops worker and closes Redis connections.
