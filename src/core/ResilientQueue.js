@@ -81,8 +81,8 @@ class ResilientQueue {
 
     const { concurrency = 1 } = options;
 
-    if (concurrency < 1) {
-      throw new Error("Concurrency must be at least 1");
+    if (!Number.isInteger(concurrency) || concurrency < 1) {
+      throw new Error("Concurrency must be a positive integer");
     }
 
     this.isRunning = true;
@@ -92,7 +92,7 @@ class ResilientQueue {
     const startWorker = async () => {
       while (this.isRunning) {
         try {
-          // IMPORTANT: timeout = 1 for graceful shutdown
+          // Timeout = 1 second for graceful shutdown.
           const result = await this.consumer.blpop(
             this.mainQueueKey,
             1
@@ -107,13 +107,14 @@ class ResilientQueue {
 
           try {
             job = JSON.parse(rawJob);
-          } catch {
+          } catch (error) {
+            // Skip malformed jobs.
             continue;
           }
 
           let shouldProceed = true;
 
-          // Apply idempotency only on first attempt
+          // Apply idempotency only on the first attempt.
           if (job.attempt === 0) {
             shouldProceed =
               await this.idempotencyManager.shouldProcess(
@@ -129,17 +130,23 @@ class ResilientQueue {
           try {
             await handler(job);
           } catch (error) {
-              await this.retryManager.handleFailure(job, error);
-          // Silent safety net
+            await this.retryManager.handleFailure(job, error);
+          }
+        } catch (error) {
+          // Keep the worker alive if a queue operation fails.
+          if (this.isRunning) {
+            console.error("Worker encountered an error:", error);
+          }
         }
       }
     };
 
-    // Start worker pool
+    // Start the worker pool.
     for (let i = 0; i < concurrency; i++) {
       this.workers.push(startWorker());
     }
   }
+
 
   /**
    * Stop the worker loop.
@@ -167,3 +174,4 @@ class ResilientQueue {
 }
 
 module.exports = ResilientQueue;
+ 
