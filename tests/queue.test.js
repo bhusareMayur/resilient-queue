@@ -111,4 +111,49 @@ describe("ResilientQueue Core Behavior", () => {
 
     expect(count).toBe(1);
   });
+  
+  test("recovers delayed retry after queue restart", async () => {
+  const job = {
+    id: "restart-retry-test",
+    data: { test: "restart-retry" },
+    attempt: 0,
+    idempotencyKey: null,
+    ttlSeconds: null,
+    createdAt: Date.now()
+  };
+
+  // Persist a delayed retry without starting workers.
+  await queue.retryManager.handleFailure(
+    job,
+    new RetryableError("temporary failure")
+  );
+
+  // Simulate the original queue process shutting down.
+  await queue.close();
+
+  // Wait until the persisted retry becomes due.
+  await new Promise(resolve => setTimeout(resolve, 300));
+
+  // Simulate a new application process using the same Redis.
+  queue = new ResilientQueue({
+    redisUrl,
+    maxRetries: 1,
+    baseDelay: 100
+  });
+
+  let processed = false;
+
+  queue.process(async recoveredJob => {
+    if (recoveredJob.id === job.id) {
+      processed = true;
+    }
+  });
+
+  await new Promise(resolve => setTimeout(resolve, 500));
+
+  expect(processed).toBe(true);
+
+  const delayedJobs = await redis.zcard("rq:delayed");
+  expect(delayedJobs).toBe(0);
+});
 });

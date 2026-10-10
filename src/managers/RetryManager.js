@@ -53,16 +53,53 @@ class RetryManager {
       retriedAt: Date.now()
     };
 
-    // Requeue job after exponential delay
-    setTimeout(() => {
-      this.redis
-        .rpush(mainQueueKey, JSON.stringify(retryJob))
-        .catch(err => {
-          // If requeue fails, move job to DLQ
-          this.dlqManager.moveToDLQ(retryJob, err);
-        });
-    }, delay);
+    // Persist the retry in Redis until it is due.
+   const delayedQueueKey = `${this.keyPrefix}:delayed`;
+   const executeAt = Date.now() + delay;
+
+    await this.redis.zadd(
+      delayedQueueKey,
+      executeAt,
+      JSON.stringify(retryJob)
+    ); 
   }
+  /**
+ * Move due retries from the delayed ZSET to the main queue.
+ * The Lua script makes the move atomic.
+ */
+async promoteDueRetries() {
+  const delayedQueueKey = `${this.keyPrefix}:delayed`;
+  const mainQueueKey = `${this.keyPrefix}:main`;
+
+  const script = `
+    local jobs = redis.call(
+      'ZRANGEBYSCORE',
+      KEYS[1],
+      '-inf',
+      ARGV[1],
+      'LIMIT',
+      0,
+      ARGV[2]
+    )
+
+    for _, job in ipairs(jobs) do
+      if redis.call('ZREM', KEYS[1], job) == 1 then
+        redis.call('RPUSH', KEYS[2], job)
+      end
+    end
+
+    return #jobs
+  `;
+
+  return this.redis.eval(
+    script,
+    2,
+    delayedQueueKey,
+    mainQueueKey,
+    Date.now(),
+    100
+  );
+}
 }
 
 module.exports = RetryManager;

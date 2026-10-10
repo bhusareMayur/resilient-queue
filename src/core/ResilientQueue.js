@@ -25,6 +25,7 @@ class ResilientQueue {
     this.mainQueueKey = `${keyPrefix}:main`;
     this.isRunning = false;
     this.workerCount = 0;
+    this.retryScheduler = null;
 
     const redisClientWrapper = new RedisClient(redisUrl);
 
@@ -88,6 +89,25 @@ class ResilientQueue {
     this.isRunning = true;
     this.workerCount = concurrency;
     this.workers = [];
+    // Recover persisted retries and periodically promote due jobs.
+if (this.retryScheduler) {
+  clearInterval(this.retryScheduler);
+}
+
+const promoteRetries = async () => {
+  try {
+    await this.retryManager.promoteDueRetries();
+  } catch (error) {
+    if (this.isRunning) {
+      console.error("Retry scheduler encountered an error:", error);
+    }
+  }
+};
+
+// Recover due jobs immediately, then poll periodically.
+promoteRetries();
+
+this.retryScheduler = setInterval(promoteRetries, 100);
 
     const startWorker = async () => {
       while (this.isRunning) {
@@ -153,15 +173,20 @@ class ResilientQueue {
    */
   async stop() {
     this.isRunning = false;
-  }
+
+    if (this.retryScheduler) {
+      clearInterval(this.retryScheduler);
+      this.retryScheduler = null;
+    }
+}
 
   /**
    * Stop worker and close Redis connections safely.
    */
   async close() {
-    this.isRunning = false;
+    await this.stop();
 
-    // Await all active workers to finish their current execution
+     // Await all active workers to finish their current execution
     if (this.workers && this.workers.length > 0) {
       await Promise.all(this.workers);
     }
