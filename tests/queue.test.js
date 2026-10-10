@@ -28,9 +28,12 @@ describe("ResilientQueue Core Behavior", () => {
     });
   });
 
-  afterEach(async () => {
+afterEach(async () => {
+  if (queue) {
     await queue.close();
-  });
+    queue = null;
+  }
+});
 
   afterAll(async () => {
     await redis.quit();
@@ -111,8 +114,22 @@ describe("ResilientQueue Core Behavior", () => {
 
     expect(count).toBe(1);
   });
-  
-  test("recovers delayed retry after queue restart", async () => {
+
+
+test("recovers delayed retry after queue restart", async () => {
+  const retryBaseDelay = 1000;
+
+  // Close the queue created by beforeEach() to avoid leaking
+  // its producer and consumer Redis connections.
+  await queue.close();
+
+  // Create a fresh queue with a longer retry delay.
+  queue = new ResilientQueue({
+    redisUrl,
+    maxRetries: 1,
+    baseDelay: retryBaseDelay
+  });
+
   const job = {
     id: "restart-retry-test",
     data: { test: "restart-retry" },
@@ -122,38 +139,67 @@ describe("ResilientQueue Core Behavior", () => {
     createdAt: Date.now()
   };
 
+
   // Persist a delayed retry without starting workers.
   await queue.retryManager.handleFailure(
     job,
     new RetryableError("temporary failure")
   );
 
-  // Simulate the original queue process shutting down.
-  await queue.close();
+  expect(await redis.zcard("rq:delayed")).toBe(1);
 
-  // Wait until the persisted retry becomes due.
-  await new Promise(resolve => setTimeout(resolve, 300));
+  // Stop before the retry becomes due.
+  // await new Promise(resolve => setTimeout(resolve, 100));
+  // await queue.close();
+  // Stop before the retry becomes due.
+await new Promise(resolve => setTimeout(resolve, 100));
 
-  // Simulate a new application process using the same Redis.
+// console.log("[diagnostic] Closing first queue");
+await queue.close();
+// console.log("[diagnostic] First queue closed");
+
+// console.log("[diagnostic] Creating replacement queue");
+//
+
+  // Restart using the same Redis instance and key prefix.
   queue = new ResilientQueue({
     redisUrl,
     maxRetries: 1,
-    baseDelay: 100
+    baseDelay: retryBaseDelay
   });
 
-  let processed = false;
+  let resolveProcessed;
+
+  const processed = new Promise(resolve => {
+    resolveProcessed = resolve;
+  });
 
   queue.process(async recoveredJob => {
     if (recoveredJob.id === job.id) {
-      processed = true;
+      resolveProcessed(recoveredJob);
     }
   });
 
-  await new Promise(resolve => setTimeout(resolve, 500));
+  let timer;
 
-  expect(processed).toBe(true);
+  try {
+    const recoveredJob = await Promise.race([
+      processed,
+      new Promise((_, reject) => {
+        timer = setTimeout(() => {
+          reject(
+            new Error("Retry was not recovered within 5 seconds")
+          );
+        }, 5000);
+      })
+    ]);
 
-  const delayedJobs = await redis.zcard("rq:delayed");
-  expect(delayedJobs).toBe(0);
+    expect(recoveredJob.id).toBe(job.id);
+  } finally {
+    clearTimeout(timer);
+  }
+
+  expect(await redis.zcard("rq:delayed")).toBe(0);
+  // console.log("[diagnostic] Restart test assertions completed");
 });
 });

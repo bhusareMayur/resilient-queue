@@ -53,15 +53,28 @@ class RetryManager {
       retriedAt: Date.now()
     };
 
-    // Persist the retry in Redis until it is due.
-   const delayedQueueKey = `${this.keyPrefix}:delayed`;
-   const executeAt = Date.now() + delay;
+// Persist the retry in Redis until it is due.
+const delayedQueueKey = `${this.keyPrefix}:delayed`;
+const executeAt = Date.now() + delay;
 
-    await this.redis.zadd(
-      delayedQueueKey,
-      executeAt,
-      JSON.stringify(retryJob)
-    ); 
+try {
+  await this.redis.zadd(
+    delayedQueueKey,
+    executeAt,
+    JSON.stringify(retryJob)
+  );
+} catch (storageError) {
+  try {
+    await this.dlqManager.moveToDLQ(retryJob, storageError);
+  } catch (dlqError) {
+    const error = new Error(
+      "Failed to persist retry and failed to move job to DLQ"
+    );
+    error.storageError = storageError;
+    error.dlqError = dlqError;
+    throw error;
+  }
+}
   }
   /**
  * Move due retries from the delayed ZSET to the main queue.
@@ -71,25 +84,34 @@ async promoteDueRetries() {
   const delayedQueueKey = `${this.keyPrefix}:delayed`;
   const mainQueueKey = `${this.keyPrefix}:main`;
 
-  const script = `
-    local jobs = redis.call(
-      'ZRANGEBYSCORE',
-      KEYS[1],
-      '-inf',
-      ARGV[1],
-      'LIMIT',
-      0,
-      ARGV[2]
+ const script = `
+  -- Validate the destination before modifying the delayed queue.
+  local destinationType = redis.call('TYPE', KEYS[2]).ok
+
+  if destinationType ~= 'none' and destinationType ~= 'list' then
+    return redis.error_reply(
+      'Main queue key must be a Redis list'
     )
+  end
 
-    for _, job in ipairs(jobs) do
-      if redis.call('ZREM', KEYS[1], job) == 1 then
-        redis.call('RPUSH', KEYS[2], job)
-      end
+  local jobs = redis.call(
+    'ZRANGEBYSCORE',
+    KEYS[1],
+    '-inf',
+    ARGV[1],
+    'LIMIT',
+    0,
+    ARGV[2]
+  )
+
+  for _, job in ipairs(jobs) do
+    if redis.call('ZREM', KEYS[1], job) == 1 then
+      redis.call('RPUSH', KEYS[2], job)
     end
+  end
 
-    return #jobs
-  `;
+  return #jobs
+`;
 
   return this.redis.eval(
     script,
