@@ -25,11 +25,13 @@ class ResilientQueue {
     this.mainQueueKey = `${keyPrefix}:main`;
     this.isRunning = false;
     this.workerCount = 0;
+    this.retryScheduler = null;
+    this.retrySchedulerTask = null;
 
-    const redisClientWrapper = new RedisClient(redisUrl);
+  this.redisClientWrapper = new RedisClient(redisUrl);
 
-    this.producer = redisClientWrapper.getProducer();
-    this.consumer = redisClientWrapper.getConsumer();
+  this.producer = this.redisClientWrapper.getProducer();
+  this.consumer = this.redisClientWrapper.getConsumer();
 
     this.idempotencyManager = new IdempotencyManager(
       this.producer,
@@ -88,6 +90,40 @@ class ResilientQueue {
     this.isRunning = true;
     this.workerCount = concurrency;
     this.workers = [];
+// Recover persisted retries without overlapping scheduler calls.
+if (this.retryScheduler) {
+  clearTimeout(this.retryScheduler);
+  this.retryScheduler = null;
+}
+
+const promoteRetries = async () => {
+  if (!this.isRunning) {
+    return;
+  }
+
+  this.retrySchedulerTask = (async () => {
+    try {
+      await this.retryManager.promoteDueRetries();
+    } catch (error) {
+      if (this.isRunning) {
+        console.error("Retry scheduler encountered an error:", error);
+      }
+    }
+  })();
+
+  try {
+    await this.retrySchedulerTask;
+  } finally {
+    this.retrySchedulerTask = null;
+
+    if (this.isRunning) {
+      this.retryScheduler = setTimeout(promoteRetries, 100);
+    }
+  }
+};
+
+// Recover due jobs immediately.
+this.retryScheduler = setTimeout(promoteRetries, 0);
 
     const startWorker = async () => {
       while (this.isRunning) {
@@ -151,26 +187,39 @@ class ResilientQueue {
   /**
    * Stop the worker loop.
    */
-  async stop() {
-    this.isRunning = false;
+
+async stop() {
+  this.isRunning = false;
+
+  if (this.retryScheduler) {
+    clearTimeout(this.retryScheduler);
+    this.retryScheduler = null;
   }
+
+  const schedulerTask = this.retrySchedulerTask;
+
+  if (schedulerTask) {
+    await schedulerTask;
+  }
+}
+
 
   /**
    * Stop worker and close Redis connections safely.
    */
-  async close() {
-    this.isRunning = false;
 
-    // Await all active workers to finish their current execution
+async close() {
+  await this.stop();
+
+  try {
     if (this.workers && this.workers.length > 0) {
       await Promise.all(this.workers);
     }
-
-    await Promise.all([
-      this.producer.quit(),
-      this.consumer.quit()
-    ]);
+  } finally {
+    await this.redisClientWrapper.disconnect();
   }
+}
+
 }
 
 module.exports = ResilientQueue;
