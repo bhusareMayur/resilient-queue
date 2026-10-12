@@ -24,9 +24,13 @@ class ResilientQueue {
     this.keyPrefix = keyPrefix;
     this.mainQueueKey = `${keyPrefix}:main`;
     this.isRunning = false;
+    this.isClosed = false;
     this.workerCount = 0;
     this.retryScheduler = null;
     this.retrySchedulerTask = null;
+    this.activeJobs = new Set();
+    this.fetcherPromise = null;
+    this.workers = [];
 
   this.redisClientWrapper = new RedisClient(redisUrl);
 
@@ -87,46 +91,80 @@ class ResilientQueue {
       throw new Error("Concurrency must be a positive integer");
     }
 
+    if (this.isRunning) {
+      throw new Error("Queue is already processing");
+    }
+
     this.isRunning = true;
     this.workerCount = concurrency;
-    this.workers = [];
-// Recover persisted retries without overlapping scheduler calls.
-if (this.retryScheduler) {
-  clearTimeout(this.retryScheduler);
-  this.retryScheduler = null;
-}
+    this.activeJobs = new Set();
 
-const promoteRetries = async () => {
-  if (!this.isRunning) {
-    return;
-  }
+    // Recover persisted retries without overlapping scheduler calls.
+    if (this.retryScheduler) {
+      clearTimeout(this.retryScheduler);
+      this.retryScheduler = null;
+    }
 
-  this.retrySchedulerTask = (async () => {
-    try {
-      await this.retryManager.promoteDueRetries();
-    } catch (error) {
-      if (this.isRunning) {
-        console.error("Retry scheduler encountered an error:", error);
+    const promoteRetries = async () => {
+      if (!this.isRunning) {
+        return;
       }
-    }
-  })();
 
-  try {
-    await this.retrySchedulerTask;
-  } finally {
-    this.retrySchedulerTask = null;
+      this.retrySchedulerTask = (async () => {
+        try {
+          await this.retryManager.promoteDueRetries();
+        } catch (error) {
+          if (this.isRunning) {
+            console.error("Retry scheduler encountered an error:", error);
+          }
+        }
+      })();
 
-    if (this.isRunning) {
-      this.retryScheduler = setTimeout(promoteRetries, 100);
-    }
-  }
-};
+      try {
+        await this.retrySchedulerTask;
+      } finally {
+        this.retrySchedulerTask = null;
 
-// Recover due jobs immediately.
-this.retryScheduler = setTimeout(promoteRetries, 0);
+        if (this.isRunning) {
+          this.retryScheduler = setTimeout(promoteRetries, 100);
+        }
+      }
+    };
 
-    const startWorker = async () => {
+    // Recover due jobs immediately.
+    this.retryScheduler = setTimeout(promoteRetries, 0);
+
+    const executeJob = async (job) => {
+      let shouldProceed = true;
+
+      // Apply idempotency only on the first attempt.
+      if (job.attempt === 0) {
+        shouldProceed =
+          await this.idempotencyManager.shouldProcess(
+            job.idempotencyKey,
+            job.ttlSeconds
+          );
+      }
+
+      if (!shouldProceed) {
+        return;
+      }
+
+      try {
+        await handler(job);
+      } catch (error) {
+        await this.retryManager.handleFailure(job, error);
+      }
+    };
+
+    const runFetcher = async () => {
       while (this.isRunning) {
+        // Wait if in-memory concurrency limit is reached
+        if (this.activeJobs.size >= concurrency) {
+          await Promise.race(Array.from(this.activeJobs));
+          continue;
+        }
+
         try {
           // Timeout = 1 second for graceful shutdown.
           const result = await this.consumer.blpop(
@@ -148,28 +186,23 @@ this.retryScheduler = setTimeout(promoteRetries, 0);
             continue;
           }
 
-          let shouldProceed = true;
+          // Dispatch job to the in-memory pool
+          let jobPromise;
+          jobPromise = (async () => {
+            try {
+              await executeJob(job);
+            } catch (error) {
+              if (this.isRunning) {
+                console.error("Worker encountered an error:", error);
+              }
+            } finally {
+              this.activeJobs.delete(jobPromise);
+            }
+          })();
 
-          // Apply idempotency only on the first attempt.
-          if (job.attempt === 0) {
-            shouldProceed =
-              await this.idempotencyManager.shouldProcess(
-                job.idempotencyKey,
-                job.ttlSeconds
-              );
-          }
-
-          if (!shouldProceed) {
-            continue;
-          }
-
-          try {
-            await handler(job);
-          } catch (error) {
-            await this.retryManager.handleFailure(job, error);
-          }
+          this.activeJobs.add(jobPromise);
         } catch (error) {
-          // Keep the worker alive if a queue operation fails.
+          // Keep the fetcher alive if a queue operation fails.
           if (this.isRunning) {
             console.error("Worker encountered an error:", error);
           }
@@ -177,48 +210,56 @@ this.retryScheduler = setTimeout(promoteRetries, 0);
       }
     };
 
-    // Start the worker pool.
-    for (let i = 0; i < concurrency; i++) {
-      this.workers.push(startWorker());
-    }
+    this.fetcherPromise = runFetcher();
+    this.workers = [this.fetcherPromise];
   }
-
 
   /**
-   * Stop the worker loop.
+   * Stop the worker loop and wait for in-flight tasks to finish.
    */
+  async stop() {
+    this.isRunning = false;
 
-async stop() {
-  this.isRunning = false;
+    if (this.retryScheduler) {
+      clearTimeout(this.retryScheduler);
+      this.retryScheduler = null;
+    }
 
-  if (this.retryScheduler) {
-    clearTimeout(this.retryScheduler);
-    this.retryScheduler = null;
+    const schedulerTask = this.retrySchedulerTask;
+
+    if (schedulerTask) {
+      await schedulerTask;
+    }
+
+    if (this.fetcherPromise) {
+      await this.fetcherPromise;
+      this.fetcherPromise = null;
+    }
+
+    if (this.activeJobs && this.activeJobs.size > 0) {
+      await Promise.all(Array.from(this.activeJobs));
+    }
   }
-
-  const schedulerTask = this.retrySchedulerTask;
-
-  if (schedulerTask) {
-    await schedulerTask;
-  }
-}
-
 
   /**
    * Stop worker and close Redis connections safely.
    */
-
-async close() {
-  await this.stop();
-
-  try {
-    if (this.workers && this.workers.length > 0) {
-      await Promise.all(this.workers);
+  async close() {
+    if (this.isClosed) {
+      return;
     }
-  } finally {
-    await this.redisClientWrapper.disconnect();
+    this.isClosed = true;
+
+    await this.stop();
+
+    try {
+      if (this.workers && this.workers.length > 0) {
+        await Promise.all(this.workers);
+      }
+    } finally {
+      await this.redisClientWrapper.disconnect();
+    }
   }
-}
 
 }
 

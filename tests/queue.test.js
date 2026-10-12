@@ -202,4 +202,88 @@ await queue.close();
   expect(await redis.zcard("rq:delayed")).toBe(0);
   // console.log("[diagnostic] Restart test assertions completed");
 });
+
+  test("processes multiple jobs concurrently according to concurrency option", async () => {
+    const concurrency = 3;
+    let running = 0;
+    let maxRunning = 0;
+    const processed = [];
+
+    queue.process(
+      async (job) => {
+        running++;
+        maxRunning = Math.max(maxRunning, running);
+        await new Promise((resolve) => setTimeout(resolve, 200));
+        running--;
+        processed.push(job.data.index);
+      },
+      { concurrency }
+    );
+
+    await new Promise((r) => setTimeout(r, 100));
+
+    await Promise.all([
+      queue.enqueue({ index: 1 }),
+      queue.enqueue({ index: 2 }),
+      queue.enqueue({ index: 3 })
+    ]);
+
+    await new Promise((r) => setTimeout(r, 600));
+
+    expect(processed.length).toBe(3);
+    expect(maxRunning).toBe(concurrency);
+  });
+
+  test("limits concurrency to specified limit", async () => {
+    const concurrency = 2;
+    let running = 0;
+    let maxRunning = 0;
+    const processed = [];
+
+    queue.process(
+      async (job) => {
+        running++;
+        maxRunning = Math.max(maxRunning, running);
+        await new Promise((resolve) => setTimeout(resolve, 200));
+        running--;
+        processed.push(job.data.index);
+      },
+      { concurrency }
+    );
+
+    await new Promise((r) => setTimeout(r, 100));
+
+    await Promise.all([
+      queue.enqueue({ index: 1 }),
+      queue.enqueue({ index: 2 }),
+      queue.enqueue({ index: 3 }),
+      queue.enqueue({ index: 4 })
+    ]);
+
+    await new Promise((r) => setTimeout(r, 800));
+
+    expect(processed.length).toBe(4);
+    expect(maxRunning).toBe(2);
+  });
+
+  test("graceful shutdown waits for in-flight jobs to complete", async () => {
+    let completed = false;
+
+    queue.process(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 300));
+      completed = true;
+    });
+
+    await new Promise((r) => setTimeout(r, 100));
+    await queue.enqueue({ test: "in-flight" });
+
+    // Allow worker to pick up the job
+    await new Promise((r) => setTimeout(r, 100));
+
+    // Close queue while job is still in progress
+    await queue.close();
+
+    expect(completed).toBe(true);
+  });
 });
+
