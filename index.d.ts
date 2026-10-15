@@ -68,6 +68,16 @@ export interface Job<T = any> {
    * Per-dequeue fencing token identifying this specific execution lease.
    */
   lockToken?: string;
+
+  /**
+   * Optional delay in milliseconds applied when the job was enqueued.
+   */
+  delay?: number;
+
+  /**
+   * Unix timestamp (in milliseconds) when the job is scheduled to execute.
+   */
+  runAt?: number;
 }
 
 /**
@@ -197,6 +207,36 @@ export interface EnqueueOptions {
    * Time-to-live in seconds for the idempotency key in Redis.
    */
   ttlSeconds?: number | null;
+
+  /**
+   * Delay in milliseconds before the job becomes eligible for processing.
+   */
+  delay?: number;
+
+  /**
+   * Exact Date or Unix timestamp (in milliseconds) when the job should run.
+   */
+  runAt?: Date | number;
+}
+
+/**
+ * Item specification for enqueueMany.
+ */
+export interface EnqueueManyItem<T = any> extends EnqueueOptions {
+  /**
+   * The job data payload.
+   */
+  data: T;
+
+  /**
+   * Per-job options overriding batch defaults.
+   */
+  options?: EnqueueOptions;
+
+  /**
+   * Alias for options.
+   */
+  opts?: EnqueueOptions;
 }
 
 /**
@@ -316,10 +356,22 @@ export class ResilientQueue {
    * Enqueues a new job.
    *
    * @param data Any JSON-serializable job payload.
-   * @param options Optional enqueue settings (idempotency key and TTL).
+   * @param options Optional enqueue settings (idempotency key, TTL, delay, and runAt).
    * @returns Resolves to the unique UUID v4 generated for the job, or existing job ID if idempotencyKey was already registered.
    */
   enqueue<T = any>(data: T, options?: EnqueueOptions): Promise<string>;
+
+  /**
+   * Enqueues multiple jobs in a single Redis network round-trip using an ioredis pipeline.
+   *
+   * @param jobs Array of job specifications ({ data, ...options } or plain data payloads).
+   * @param defaultOptions Optional default enqueue settings applied to each job in the batch.
+   * @returns Resolves to an array of job UUIDs in the same order as input jobs.
+   */
+  enqueueMany<T = any>(
+    jobs: (EnqueueManyItem<T> | T)[],
+    defaultOptions?: EnqueueOptions
+  ): Promise<string[]>;
 
   /**
    * Starts processing jobs using the provided worker handler function.
@@ -385,6 +437,13 @@ export class ResilientQueue {
    * @returns Total number of jobs purged.
    */
   purgeDLQ(): Promise<number>;
+
+  /**
+   * Manually promotes due delayed and retry jobs from the delayed sorted set to the main queue.
+   *
+   * @returns Number of jobs promoted to the main queue.
+   */
+  promoteDelayedJobs(): Promise<number>;
 }
 
 /**

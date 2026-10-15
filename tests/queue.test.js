@@ -1584,3 +1584,436 @@ describe("Native Dead-Letter Queue (DLQ) Management API", () => {
     expect(await queue.getDLQCount()).toBe(0);
   });
 });
+
+describe("Delayed Jobs directly from enqueue()", () => {
+  let queue;
+  let redis;
+
+  beforeAll(async () => {
+    redis = new Redis(redisUrl);
+  });
+
+  beforeEach(async () => {
+    await redis.flushall();
+
+    queue = new ResilientQueue({
+      redisUrl,
+      maxRetries: 1,
+      baseDelay: 100
+    });
+  });
+
+  afterEach(async () => {
+    if (queue) {
+      await queue.close();
+      queue = null;
+    }
+  });
+
+  afterAll(async () => {
+    await redis.flushall();
+    await redis.quit();
+  });
+
+  test("enqueues delayed job with { delay: ms } into sorted set with correct score and not in main queue", async () => {
+    const before = Date.now();
+    const jobId = await queue.enqueue(
+      { email: "user@example.com" },
+      { delay: 5000 }
+    );
+    const after = Date.now();
+
+    expect(typeof jobId).toBe("string");
+    expect(await redis.llen("rq:main")).toBe(0);
+    expect(await redis.zcard("rq:delayed")).toBe(1);
+
+    const items = await redis.zrangebyscore("rq:delayed", "-inf", "+inf", "WITHSCORES");
+    expect(items.length).toBe(2);
+
+    const [rawJob, scoreStr] = items;
+    const score = Number(scoreStr);
+    expect(score).toBeGreaterThanOrEqual(before + 5000);
+    expect(score).toBeLessThanOrEqual(after + 5000);
+
+    const job = JSON.parse(rawJob);
+    expect(job.id).toBe(jobId);
+    expect(job.data).toEqual({ email: "user@example.com" });
+    expect(job.delay).toBe(5000);
+  });
+
+  test("enqueues delayed job with runAt as Date object", async () => {
+    const targetDate = new Date(Date.now() + 60000);
+    const jobId = await queue.enqueue(
+      { email: "user@example.com" },
+      { runAt: targetDate }
+    );
+
+    expect(typeof jobId).toBe("string");
+    expect(await redis.llen("rq:main")).toBe(0);
+    expect(await redis.zcard("rq:delayed")).toBe(1);
+
+    const items = await redis.zrangebyscore("rq:delayed", "-inf", "+inf", "WITHSCORES");
+    expect(items.length).toBe(2);
+
+    const [rawJob, scoreStr] = items;
+    expect(Number(scoreStr)).toBe(targetDate.getTime());
+
+    const job = JSON.parse(rawJob);
+    expect(job.id).toBe(jobId);
+    expect(job.runAt).toBe(targetDate.getTime());
+  });
+
+  test("enqueues delayed job with runAt as numeric timestamp", async () => {
+    const targetTimestamp = Date.now() + 30000;
+    const jobId = await queue.enqueue(
+      { email: "user@example.com" },
+      { runAt: targetTimestamp }
+    );
+
+    expect(typeof jobId).toBe("string");
+    expect(await redis.llen("rq:main")).toBe(0);
+    expect(await redis.zcard("rq:delayed")).toBe(1);
+
+    const items = await redis.zrangebyscore("rq:delayed", "-inf", "+inf", "WITHSCORES");
+    expect(Number(items[1])).toBe(targetTimestamp);
+
+    const job = JSON.parse(items[0]);
+    expect(job.id).toBe(jobId);
+    expect(job.runAt).toBe(targetTimestamp);
+  });
+
+  test("promotes and processes delayed job when scheduled time arrives", async () => {
+    let processed = false;
+    let processedData = null;
+
+    queue.process(async (job) => {
+      processed = true;
+      processedData = job.data;
+    });
+
+    await new Promise((r) => setTimeout(r, 100));
+
+    await queue.enqueue(
+      { email: "delayed@example.com" },
+      { delay: 200 }
+    );
+
+    expect(processed).toBe(false);
+    expect(await redis.zcard("rq:delayed")).toBe(1);
+
+    await waitForCondition(async () => processed, 4000);
+
+    expect(processed).toBe(true);
+    expect(processedData).toEqual({ email: "delayed@example.com" });
+    expect(await redis.zcard("rq:delayed")).toBe(0);
+    expect(await redis.llen("rq:main")).toBe(0);
+  });
+
+  test("supports manual promoteDelayedJobs", async () => {
+    await queue.enqueue(
+      { task: "promote-me" },
+      { delay: 50 }
+    );
+
+    expect(await redis.zcard("rq:delayed")).toBe(1);
+    expect(await redis.llen("rq:main")).toBe(0);
+
+    // Wait until due
+    await new Promise((r) => setTimeout(r, 70));
+
+    const promotedCount = await queue.promoteDelayedJobs();
+    expect(promotedCount).toBe(1);
+    expect(await redis.zcard("rq:delayed")).toBe(0);
+    expect(await redis.llen("rq:main")).toBe(1);
+  });
+
+  test("supports idempotency for delayed jobs without duplicating in sorted set", async () => {
+    const id1 = await queue.enqueue(
+      { email: "user@example.com" },
+      { delay: 5000, idempotencyKey: "delayed-unique-key" }
+    );
+
+    const id2 = await queue.enqueue(
+      { email: "duplicate@example.com" },
+      { delay: 5000, idempotencyKey: "delayed-unique-key" }
+    );
+
+    expect(id2).toBe(id1);
+    expect(await redis.zcard("rq:delayed")).toBe(1);
+    expect(await redis.llen("rq:main")).toBe(0);
+
+    const storedId = await redis.get("rq:idempotency:delayed-unique-key");
+    expect(storedId).toBe(id1);
+  });
+
+  test("idempotent delayed job is executed exactly once by worker", async () => {
+    let executionCount = 0;
+
+    queue.process(async () => {
+      executionCount++;
+    });
+
+    await new Promise((r) => setTimeout(r, 100));
+
+    await queue.enqueue(
+      { test: "idempotent-delayed" },
+      { delay: 150, idempotencyKey: "idempotent-delayed-job" }
+    );
+
+    await queue.enqueue(
+      { test: "idempotent-delayed-duplicate" },
+      { delay: 150, idempotencyKey: "idempotent-delayed-job" }
+    );
+
+    await waitForCondition(async () => executionCount === 1, 4000);
+
+    // Wait extra to guarantee no second execution occurs
+    await new Promise((r) => setTimeout(r, 300));
+    expect(executionCount).toBe(1);
+  });
+
+  test("validates delay and runAt options strictly", async () => {
+    await expect(
+      queue.enqueue({ test: 1 }, { delay: -500 })
+    ).rejects.toThrow(/delay must be a non-negative number/);
+
+    await expect(
+      queue.enqueue({ test: 1 }, { delay: "invalid" })
+    ).rejects.toThrow(/delay must be a non-negative number/);
+
+    await expect(
+      queue.enqueue({ test: 1 }, { delay: NaN })
+    ).rejects.toThrow(/delay must be a non-negative number/);
+
+    await expect(
+      queue.enqueue({ test: 1 }, { runAt: "not-a-date" })
+    ).rejects.toThrow(/runAt must be a valid Date or timestamp/);
+
+    await expect(
+      queue.enqueue({ test: 1 }, { runAt: new Date("invalid date") })
+    ).rejects.toThrow(/runAt must be a valid Date or timestamp/);
+
+    await expect(
+      queue.enqueue({ test: 1 }, { runAt: NaN })
+    ).rejects.toThrow(/runAt must be a valid Date or timestamp/);
+
+    await expect(
+      queue.enqueue({ test: 1 }, { delay: 5000, runAt: new Date() })
+    ).rejects.toThrow(/Cannot specify both delay and runAt/);
+  });
+});
+
+describe("High-Throughput Batch Enqueuing (enqueueMany)", () => {
+  let queue;
+  let redis;
+
+  beforeAll(async () => {
+    redis = new Redis(redisUrl);
+  });
+
+  beforeEach(async () => {
+    await redis.flushall();
+
+    queue = new ResilientQueue({
+      redisUrl,
+      maxRetries: 1,
+      baseDelay: 100
+    });
+  });
+
+  afterEach(async () => {
+    if (queue) {
+      await queue.close();
+      queue = null;
+    }
+  });
+
+  afterAll(async () => {
+    await redis.flushall();
+    await redis.quit();
+  });
+
+  test("enqueues a batch of standard jobs using an ioredis pipeline", async () => {
+    const jobIds = await queue.enqueueMany([
+      { data: { orderId: 1 } },
+      { data: { orderId: 2 } },
+      { data: { orderId: 3 } },
+    ]);
+
+    expect(Array.isArray(jobIds)).toBe(true);
+    expect(jobIds.length).toBe(3);
+
+    for (const id of jobIds) {
+      expect(typeof id).toBe("string");
+      expect(id).toMatch(/^[0-9a-f-]{36}$/);
+    }
+
+    expect(await redis.llen("rq:main")).toBe(3);
+
+    const items = await redis.lrange("rq:main", 0, -1);
+    expect(JSON.parse(items[0]).data).toEqual({ orderId: 1 });
+    expect(JSON.parse(items[1]).data).toEqual({ orderId: 2 });
+    expect(JSON.parse(items[2]).data).toEqual({ orderId: 3 });
+  });
+
+  test("processes all batch-enqueued jobs with concurrent workers", async () => {
+    const processed = [];
+
+    queue.process(
+      async (job) => {
+        processed.push(job.data.orderId);
+      },
+      { concurrency: 3 }
+    );
+
+    await new Promise((r) => setTimeout(r, 100));
+
+    await queue.enqueueMany([
+      { data: { orderId: 10 } },
+      { data: { orderId: 20 } },
+      { data: { orderId: 30 } },
+    ]);
+
+    await waitForCondition(async () => processed.length === 3, 4000);
+
+    expect(processed.sort((a, b) => a - b)).toEqual([10, 20, 30]);
+  });
+
+  test("supports delayed jobs in batch enqueuing", async () => {
+    const futureDate = new Date(Date.now() + 60000);
+
+    const jobIds = await queue.enqueueMany([
+      { data: { task: "immediate-1" } },
+      { data: { task: "delayed-1" }, delay: 5000 },
+      { data: { task: "delayed-2" }, runAt: futureDate },
+      { data: { task: "immediate-2" } },
+    ]);
+
+    expect(jobIds.length).toBe(4);
+    expect(await redis.llen("rq:main")).toBe(2);
+    expect(await redis.zcard("rq:delayed")).toBe(2);
+
+    const mainItems = await redis.lrange("rq:main", 0, -1);
+    expect(JSON.parse(mainItems[0]).data).toEqual({ task: "immediate-1" });
+    expect(JSON.parse(mainItems[1]).data).toEqual({ task: "immediate-2" });
+
+    const delayedItems = await redis.zrangebyscore("rq:delayed", "-inf", "+inf");
+    expect(delayedItems.length).toBe(2);
+  });
+
+  test("applies defaultOptions to all jobs in the batch", async () => {
+    const jobIds = await queue.enqueueMany(
+      [
+        { data: { item: 1 } },
+        { data: { item: 2 } },
+      ],
+      { delay: 3000 }
+    );
+
+    expect(jobIds.length).toBe(2);
+    expect(await redis.llen("rq:main")).toBe(0);
+    expect(await redis.zcard("rq:delayed")).toBe(2);
+  });
+
+  test("per-item options override defaultOptions in batch", async () => {
+    const jobIds = await queue.enqueueMany(
+      [
+        { data: { item: 1 } }, // inherits default delay 3000
+        { data: { item: 2 }, delay: 7000 }, // overrides default delay with 7000
+      ],
+      { delay: 3000 }
+    );
+
+    expect(jobIds.length).toBe(2);
+    expect(await redis.zcard("rq:delayed")).toBe(2);
+
+    const itemsWithScores = await redis.zrangebyscore("rq:delayed", "-inf", "+inf", "WITHSCORES");
+    const score1 = Number(itemsWithScores[1]);
+    const score2 = Number(itemsWithScores[3]);
+
+    expect(score2 - score1).toBeGreaterThanOrEqual(3900);
+  });
+
+  test("supports idempotency keys within enqueueMany and deduplicates repeats", async () => {
+    const ids1 = await queue.enqueueMany([
+      { data: { orderId: 101 }, idempotencyKey: "batch-order-101" },
+      { data: { orderId: 102 }, idempotencyKey: "batch-order-102" },
+    ]);
+
+    expect(ids1.length).toBe(2);
+    expect(await redis.llen("rq:main")).toBe(2);
+
+    // Call enqueueMany again with identical idempotency keys
+    const ids2 = await queue.enqueueMany([
+      { data: { orderId: 101, duplicate: true }, idempotencyKey: "batch-order-101" },
+      { data: { orderId: 102, duplicate: true }, idempotencyKey: "batch-order-102" },
+    ]);
+
+    expect(ids2).toEqual(ids1);
+    expect(await redis.llen("rq:main")).toBe(2);
+  });
+
+  test("supports mixed payload formats ({ data } or plain values)", async () => {
+    const jobIds = await queue.enqueueMany([
+      { data: { mode: "wrapped" } },
+      { mode: "unwrapped" },
+      "simple-string",
+      42
+    ]);
+
+    expect(jobIds.length).toBe(4);
+    expect(await redis.llen("rq:main")).toBe(4);
+
+    const items = (await redis.lrange("rq:main", 0, -1)).map((i) => JSON.parse(i).data);
+    expect(items[0]).toEqual({ mode: "wrapped" });
+    expect(items[1]).toEqual({ mode: "unwrapped" });
+    expect(items[2]).toBe("simple-string");
+    expect(items[3]).toBe(42);
+  });
+
+  test("handles empty array by returning empty array without network commands", async () => {
+    const jobIds = await queue.enqueueMany([]);
+    expect(jobIds).toEqual([]);
+    expect(await redis.llen("rq:main")).toBe(0);
+  });
+
+  test("rejects when jobs parameter is not an array", async () => {
+    await expect(queue.enqueueMany(null)).rejects.toThrow(/jobs must be an array/);
+    await expect(queue.enqueueMany({})).rejects.toThrow(/jobs must be an array/);
+    await expect(queue.enqueueMany("not-array")).rejects.toThrow(/jobs must be an array/);
+  });
+
+  test("validates all items before executing pipeline and does not perform partial enqueues", async () => {
+    await expect(
+      queue.enqueueMany([
+        { data: { index: 1 } },
+        { data: { index: 2 }, delay: -100 },
+        { data: { index: 3 } },
+      ])
+    ).rejects.toThrow(/delay must be a non-negative number/);
+
+    expect(await redis.llen("rq:main")).toBe(0);
+    expect(await redis.zcard("rq:delayed")).toBe(0);
+  });
+
+  test("high-throughput test enqueues 1,000 jobs in a single pipeline call", async () => {
+    const count = 1000;
+    const batch = Array.from({ length: count }, (_, i) => ({
+      data: { orderId: i + 1 }
+    }));
+
+    const startTime = Date.now();
+    const jobIds = await queue.enqueueMany(batch);
+    const elapsed = Date.now() - startTime;
+
+    expect(jobIds.length).toBe(count);
+    expect(await redis.llen("rq:main")).toBe(count);
+
+    // Verify all IDs are unique
+    const uniqueIds = new Set(jobIds);
+    expect(uniqueIds.size).toBe(count);
+
+    // Verify throughput: 1000 jobs enqueued in pipeline should be well under 2000ms
+    expect(elapsed).toBeLessThan(2000);
+  });
+});

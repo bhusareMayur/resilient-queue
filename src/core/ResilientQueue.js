@@ -47,6 +47,7 @@ class ResilientQueue {
 
     this.keyPrefix = keyPrefix;
     this.mainQueueKey = `${keyPrefix}:main`;
+    this.delayedQueueKey = `${keyPrefix}:delayed`;
     this.isRunning = false;
     this.isClosed = false;
     this.workerCount = 0;
@@ -92,15 +93,45 @@ class ResilientQueue {
   }
 
   /**
-   * Enqueue a new job.
+   * Validates options and creates the job descriptor.
    */
-  async enqueue(data, options = {}) {
-    const { idempotencyKey, ttlSeconds } = options || {};
+  _prepareJob(data, options = {}) {
+    const { idempotencyKey, ttlSeconds, delay, runAt } = options || {};
 
     if (ttlSeconds !== undefined && ttlSeconds !== null) {
       if (typeof ttlSeconds !== "number" || !Number.isInteger(ttlSeconds)) {
         throw new Error("ttlSeconds must be an integer");
       }
+    }
+
+    let isDelayed = false;
+    let executeAt = null;
+
+    if (delay !== undefined && delay !== null) {
+      if (typeof delay !== "number" || !Number.isFinite(delay) || delay < 0) {
+        throw new Error("delay must be a non-negative number");
+      }
+      isDelayed = true;
+      executeAt = Date.now() + delay;
+    }
+
+    if (runAt !== undefined && runAt !== null) {
+      if (delay !== undefined && delay !== null) {
+        throw new Error("Cannot specify both delay and runAt");
+      }
+      let timestamp;
+      if (runAt instanceof Date) {
+        timestamp = runAt.getTime();
+        if (isNaN(timestamp)) {
+          throw new Error("runAt must be a valid Date or timestamp");
+        }
+      } else if (typeof runAt === "number" && Number.isFinite(runAt)) {
+        timestamp = runAt;
+      } else {
+        throw new Error("runAt must be a valid Date or timestamp");
+      }
+      isDelayed = true;
+      executeAt = timestamp;
     }
 
     const job = {
@@ -112,6 +143,50 @@ class ResilientQueue {
       ttlSeconds: ttlSeconds ?? null,
       createdAt: Date.now()
     };
+
+    if (delay !== undefined && delay !== null) {
+      job.delay = delay;
+    }
+
+    if (runAt !== undefined && runAt !== null) {
+      job.runAt = executeAt;
+    }
+
+    return {
+      job,
+      isDelayed,
+      executeAt,
+      idempotencyKey: idempotencyKey || null,
+      ttlSeconds: ttlSeconds ?? null
+    };
+  }
+
+  /**
+   * Enqueue a new job.
+   */
+  async enqueue(data, options = {}) {
+    const { job, isDelayed, executeAt, idempotencyKey, ttlSeconds } =
+      this._prepareJob(data, options);
+
+    if (isDelayed) {
+      if (!idempotencyKey) {
+        await this.producer.zadd(
+          this.delayedQueueKey,
+          executeAt,
+          JSON.stringify(job)
+        );
+
+        return job.id;
+      }
+
+      return await this.idempotencyManager.registerAndEnqueueDelayed(
+        this.delayedQueueKey,
+        idempotencyKey,
+        job,
+        executeAt,
+        ttlSeconds
+      );
+    }
 
     if (!idempotencyKey) {
       await this.producer.rpush(
@@ -128,6 +203,93 @@ class ResilientQueue {
       job,
       ttlSeconds
     );
+  }
+
+  /**
+   * High-throughput batch enqueuing using an ioredis pipeline.
+   */
+  async enqueueMany(jobs, defaultOptions = {}) {
+    if (!Array.isArray(jobs)) {
+      throw new Error("jobs must be an array");
+    }
+
+    if (jobs.length === 0) {
+      return [];
+    }
+
+    const prepared = [];
+    for (const item of jobs) {
+      let data;
+      let itemOptions = {};
+
+      if (item && typeof item === "object" && "data" in item) {
+        data = item.data;
+        const { data: _, options: itemOpts, opts: itemOpts2, ...directOpts } = item;
+        itemOptions = Object.assign({}, directOpts, itemOpts2, itemOpts);
+      } else {
+        data = item;
+      }
+
+      const mergedOptions = Object.assign({}, defaultOptions || {}, itemOptions);
+      prepared.push(this._prepareJob(data, mergedOptions));
+    }
+
+    const pipeline = this.producer.pipeline();
+
+    for (const item of prepared) {
+      const { job, isDelayed, executeAt, idempotencyKey, ttlSeconds } = item;
+      const serialized = JSON.stringify(job);
+
+      if (isDelayed) {
+        if (!idempotencyKey) {
+          pipeline.zadd(this.delayedQueueKey, executeAt, serialized);
+        } else {
+          this.idempotencyManager.appendRegisterAndEnqueueDelayed(
+            pipeline,
+            this.delayedQueueKey,
+            idempotencyKey,
+            job,
+            executeAt,
+            ttlSeconds
+          );
+        }
+      } else {
+        if (!idempotencyKey) {
+          pipeline.rpush(this.mainQueueKey, serialized);
+        } else {
+          this.idempotencyManager.appendRegisterAndEnqueue(
+            pipeline,
+            this.mainQueueKey,
+            idempotencyKey,
+            job,
+            ttlSeconds
+          );
+        }
+      }
+    }
+
+    const results = await pipeline.exec();
+
+    if (!results) {
+      throw new Error("Pipeline execution failed: no results returned");
+    }
+
+    const jobIds = [];
+    for (let i = 0; i < results.length; i++) {
+      const [err, res] = results[i];
+      if (err) {
+        throw err;
+      }
+
+      const item = prepared[i];
+      if (item.idempotencyKey) {
+        jobIds.push(res || item.job.id);
+      } else {
+        jobIds.push(item.job.id);
+      }
+    }
+
+    return jobIds;
   }
 
   /**
@@ -461,6 +623,13 @@ class ResilientQueue {
    */
   async purgeDLQ() {
     return await this.dlqManager.purgeDLQ();
+  }
+
+  /**
+   * Manually promotes due delayed and retry jobs from the delayed sorted set to the main queue.
+   */
+  async promoteDelayedJobs() {
+    return await this.retryManager.promoteDueRetries();
   }
 }
 
