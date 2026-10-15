@@ -4,6 +4,7 @@ const RedisClient = require("../redis/RedisClient");
 const IdempotencyManager = require("../managers/IdempotencyManager");
 const DLQManager = require("../managers/DLQManager");
 const RetryManager = require("../managers/RetryManager");
+const StalledJobManager = require("../managers/StalledJobManager");
 
 /**
  * Main queue class.
@@ -14,7 +15,10 @@ class ResilientQueue {
       redisUrl,
       maxRetries = 3,
       baseDelay = 500,
-      keyPrefix = "rq"
+      keyPrefix = "rq",
+      stalledInterval = 15000,
+      lockDuration = 30000,
+      maxStalledCount = 1
     } = options;
 
     if (!redisUrl) {
@@ -28,6 +32,8 @@ class ResilientQueue {
     this.workerCount = 0;
     this.retryScheduler = null;
     this.retrySchedulerTask = null;
+    this.stalledScheduler = null;
+    this.stalledSchedulerTask = null;
     this.activeJobs = new Set();
     this.fetcherPromise = null;
     this.workers = [];
@@ -52,6 +58,17 @@ class ResilientQueue {
       this.dlqManager,
       { maxRetries, baseDelay, keyPrefix }
     );
+
+    this.stalledJobManager = new StalledJobManager(
+      this.producer,
+      {
+        keyPrefix,
+        stalledInterval,
+        lockDuration,
+        maxStalledCount,
+        maxRetries
+      }
+    );
   }
 
   /**
@@ -64,6 +81,7 @@ class ResilientQueue {
       id: uuidv4(),
       data,
       attempt: 0,
+      stalledCount: 0,
       idempotencyKey: idempotencyKey || null,
       ttlSeconds: ttlSeconds || null,
       createdAt: Date.now()
@@ -134,11 +152,49 @@ class ResilientQueue {
     // Recover due jobs immediately.
     this.retryScheduler = setTimeout(promoteRetries, 0);
 
+    // Stalled jobs recovery scheduler
+    if (this.stalledScheduler) {
+      clearTimeout(this.stalledScheduler);
+      this.stalledScheduler = null;
+    }
+
+    const promoteStalled = async () => {
+      if (!this.isRunning) {
+        return;
+      }
+
+      this.stalledSchedulerTask = (async () => {
+        try {
+          await this.stalledJobManager.recoverStalledJobs();
+        } catch (error) {
+          if (this.isRunning) {
+            console.error("Stalled job scheduler encountered an error:", error);
+          }
+        }
+      })();
+
+      try {
+        await this.stalledSchedulerTask;
+      } finally {
+        this.stalledSchedulerTask = null;
+
+        if (this.isRunning) {
+          this.stalledScheduler = setTimeout(
+            promoteStalled,
+            this.stalledJobManager.stalledInterval
+          );
+        }
+      }
+    };
+
+    // Check stalled jobs immediately on startup to recover any crashed worker jobs.
+    this.stalledScheduler = setTimeout(promoteStalled, 0);
+
     const executeJob = async (job) => {
       let shouldProceed = true;
 
-      // Apply idempotency only on the first attempt.
-      if (job.attempt === 0) {
+      // Apply idempotency only on the first attempt if it hasn't stalled.
+      if (job.attempt === 0 && !job.stalledCount) {
         shouldProceed =
           await this.idempotencyManager.shouldProcess(
             job.idempotencyKey,
@@ -153,7 +209,11 @@ class ResilientQueue {
       try {
         await handler(job);
       } catch (error) {
-        await this.retryManager.handleFailure(job, error);
+        // If the lease was lost while handler was running, the recovery scheduler
+        // already re-queued or dead-lettered this job. Do not duplicate failure handling.
+        if (!job.isLeaseLost) {
+          await this.retryManager.handleFailure(job, error);
+        }
       }
     };
 
@@ -167,24 +227,61 @@ class ResilientQueue {
 
         try {
           // Timeout = 1 second for graceful shutdown.
-          const result = await this.consumer.blpop(
-            this.mainQueueKey,
+          // Atomically moves job from rq:main to rq:active
+          const rawJob = await this.stalledJobManager.dequeue(
+            this.consumer,
             1
           );
 
-          if (!result || result.length < 2) {
+          if (!rawJob) {
             continue;
           }
 
-          const rawJob = result[1];
           let job;
 
           try {
             job = JSON.parse(rawJob);
           } catch (error) {
-            // Skip malformed jobs.
+            // Remove malformed raw job from active queue to prevent queue clogging.
+            await this.stalledJobManager.removeFromActive(rawJob);
             continue;
           }
+
+          // Attach recovery metadata stored outside the raw payload
+          const meta = await this.stalledJobManager.getStalledMetadata(job.id);
+          if (meta) {
+            job.stalledCount = meta.stalledCount;
+            job.lastStalledAt = meta.lastStalledAt;
+            if (meta.attempt !== undefined) {
+              job.attempt = meta.attempt;
+            }
+          } else {
+            job.stalledCount = job.stalledCount || 0;
+          }
+
+          // Generate per-dequeue fencing token
+          const lockToken = uuidv4();
+          job.lockToken = lockToken;
+
+          // Surface lease loss to the handler using AbortController and flags
+          const abortController = new AbortController();
+          job.signal = abortController.signal;
+          job.isLeaseLost = false;
+
+          // Acquire lock with fencing token
+          await this.stalledJobManager.acquireLock(job.id, lockToken);
+
+          // Start heartbeat with fencing token and lease loss callback
+          this.stalledJobManager.startHeartbeat(job.id, lockToken, () => {
+            job.isLeaseLost = true;
+            if (!abortController.signal.aborted) {
+              abortController.abort(
+                new Error(
+                  "Job lease lost: lock expired or was recovered as stalled by another worker"
+                )
+              );
+            }
+          });
 
           // Dispatch job to the in-memory pool
           let jobPromise;
@@ -196,6 +293,13 @@ class ResilientQueue {
                 console.error("Worker encountered an error:", error);
               }
             } finally {
+              try {
+                await this.stalledJobManager.releaseLock(rawJob, job.id, lockToken);
+              } catch (cleanupError) {
+                if (this.isRunning) {
+                  console.error("Failed to release stalled job lock:", cleanupError);
+                }
+              }
               this.activeJobs.delete(jobPromise);
             }
           })();
@@ -225,10 +329,19 @@ class ResilientQueue {
       this.retryScheduler = null;
     }
 
-    const schedulerTask = this.retrySchedulerTask;
+    if (this.stalledScheduler) {
+      clearTimeout(this.stalledScheduler);
+      this.stalledScheduler = null;
+    }
 
+    const schedulerTask = this.retrySchedulerTask;
     if (schedulerTask) {
       await schedulerTask;
+    }
+
+    const stalledTask = this.stalledSchedulerTask;
+    if (stalledTask) {
+      await stalledTask;
     }
 
     if (this.fetcherPromise) {
@@ -238,6 +351,10 @@ class ResilientQueue {
 
     if (this.activeJobs && this.activeJobs.size > 0) {
       await Promise.all(Array.from(this.activeJobs));
+    }
+
+    if (this.stalledJobManager) {
+      this.stalledJobManager.stopAllHeartbeats();
     }
   }
 
@@ -259,6 +376,13 @@ class ResilientQueue {
     } finally {
       await this.redisClientWrapper.disconnect();
     }
+  }
+
+  /**
+   * Get recovery or failure metadata stored for a job.
+   */
+  async getJobMetadata(jobId) {
+    return await this.stalledJobManager.getStalledMetadata(jobId);
   }
 
 }

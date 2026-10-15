@@ -41,6 +41,31 @@ export interface Job<T = any> {
    * Unix timestamp (in milliseconds) of the most recent retry attempt.
    */
   retriedAt?: number;
+
+  /**
+   * The number of times this job stalled (due to worker crash or timeout) and was recovered.
+   */
+  stalledCount?: number;
+
+  /**
+   * Unix timestamp (in milliseconds) when the job was most recently recovered from a stalled state.
+   */
+  lastStalledAt?: number;
+
+  /**
+   * Standard AbortSignal triggered if the job lease is lost (e.g. stalled or recovered by another worker).
+   */
+  signal?: AbortSignal;
+
+  /**
+   * Boolean flag indicating whether this worker's visibility lease for the job has expired or was revoked.
+   */
+  isLeaseLost?: boolean;
+
+  /**
+   * Per-dequeue fencing token identifying this specific execution lease.
+   */
+  lockToken?: string;
 }
 
 /**
@@ -69,6 +94,24 @@ export interface QueueOptions {
    * @default "rq"
    */
   keyPrefix?: string;
+
+  /**
+   * Interval in milliseconds at which the stalled job recovery scheduler runs.
+   * @default 15000
+   */
+  stalledInterval?: number;
+
+  /**
+   * Visibility timeout duration in milliseconds before an unacknowledged active job is considered stalled.
+   * @default 30000
+   */
+  lockDuration?: number;
+
+  /**
+   * Maximum times a job can stall (crashed worker) before being moved directly to DLQ.
+   * @default 1
+   */
+  maxStalledCount?: number;
 }
 
 /**
@@ -99,6 +142,13 @@ export interface ProcessOptions {
 
 /**
  * Handler function invoked for each dequeued job.
+ *
+ * @remarks
+ * Handlers and downstream external operations must be designed to be idempotent
+ * or use an idempotency key. While per-dequeue fencing tokens prevent a stale worker
+ * from altering Redis locks or active queue state, lease expiration cannot forcibly
+ * interrupt external side-effects already in progress. Handlers can inspect `job.signal`
+ * or pass it to abort-aware APIs (such as `fetch`) to be notified immediately upon lease loss.
  */
 export type JobHandler<T = any> = (job: Job<T>) => Promise<void> | void;
 

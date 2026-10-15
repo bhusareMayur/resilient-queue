@@ -7,12 +7,12 @@
 [![license](https://img.shields.io/npm/l/@mayurbhusare/resilient-queue?style=flat-square&color=blue)](./LICENSE)
 [![downloads](https://img.shields.io/npm/dt/@mayurbhusare/resilient-queue?style=flat-square&color=green)](https://www.npmjs.com/package/@mayurbhusare/resilient-queue)
 [![node](https://img.shields.io/node/v/@mayurbhusare/resilient-queue?style=flat-square)](https://nodejs.org)
-[![tests](https://img.shields.io/badge/tests-8%20passed-brightgreen?style=flat-square&logo=jest)](https://github.com/bhusareMayur/resilient-queue)
+[![tests](https://img.shields.io/badge/tests-16%20passed-brightgreen?style=flat-square&logo=jest)](https://github.com/bhusareMayur/resilient-queue)
 [![redis](https://img.shields.io/badge/redis-backed-red?style=flat-square&logo=redis)](https://redis.io)
 
 A lightweight, production-grade, Redis-backed job queue for Node.js.
 
-Built for resilience, **`@mayurbhusare/resilient-queue`** provides **persistent exponential backoff retries**, **crash-proof delayed retry scheduling**, **Dead-Letter Queue (DLQ)** routing, **idempotency guarantees**, **in-memory worker concurrency**, and **graceful shutdown** — all with zero framework bloat and only two lean dependencies (`ioredis` and `uuid`).
+Built for resilience, **`@mayurbhusare/resilient-queue`** provides **crash-proof in-flight job durability (stalled recovery)**, **persistent exponential backoff retries**, **atomic delayed retry scheduling**, **Dead-Letter Queue (DLQ)** routing, **idempotency guarantees**, **in-memory worker concurrency**, and **graceful shutdown** — all with zero framework bloat and only two lean dependencies (`ioredis` and `uuid`).
 
 ---
 
@@ -26,12 +26,13 @@ Built for resilience, **`@mayurbhusare/resilient-queue`** provides **persistent 
   - [Producer (Enqueuing Jobs)](#1-producer-enqueuing-jobs)
   - [Consumer (Processing Jobs & Concurrency)](#2-consumer-processing-jobs--concurrency)
   - [Job Object Anatomy](#3-job-object-anatomy)
-  - [Error Handling: Retryable vs. Fatal](#4-error-handling-retryable-vs-fatal)
-  - [Crash-Durable Delayed Retries](#5-crash-durable-delayed-retries)
-  - [Dead Letter Queue (DLQ)](#6-dead-letter-queue-dlq)
-  - [Idempotency & Expiration (TTL)](#7-idempotency--expiration-ttl)
-  - [Dual Redis Connection Architecture](#8-dual-redis-connection-architecture)
-  - [Graceful Shutdown](#9-graceful-shutdown)
+  - [Stalled Job Protection & Worker Crash Recovery](#4-stalled-job-protection--worker-crash-recovery)
+  - [Error Handling: Retryable vs. Fatal](#5-error-handling-retryable-vs-fatal)
+  - [Crash-Durable Delayed Retries](#6-crash-durable-delayed-retries)
+  - [Dead Letter Queue (DLQ)](#7-dead-letter-queue-dlq)
+  - [Idempotency & Expiration (TTL)](#8-idempotency--expiration-ttl)
+  - [Dual Redis Connection Architecture](#9-dual-redis-connection-architecture)
+  - [Graceful Shutdown](#10-graceful-shutdown)
 - [Complete API Reference](#-complete-api-reference)
 - [Redis Keys Layout](#-redis-keys-layout)
 - [Testing](#-testing)
@@ -43,12 +44,13 @@ Built for resilience, **`@mayurbhusare/resilient-queue`** provides **persistent 
 ## ✨ Features
 
 - 🚀 **Lightweight & Fast**: Built directly on top of `ioredis` with no heavy abstractions or multi-megabyte dependencies.
+- 🛡️ **Zero Data Loss on Crash (Stalled Recovery)**: Uses atomic `BLMOVE` (with `BRPOPLPUSH` fallback) to move in-flight jobs to `rq:active`. Even if your worker process suffers a hard crash (OOM, `SIGKILL`, server reboot), an active visibility heartbeat detects stalled jobs and automatically recovers them!
 - 🔁 **Exponential Backoff**: Configurable retry limit and base delay with automatic exponential backoff (`baseDelay * 2^attempt`).
 - 💾 **Crash-Durable Retries**: Scheduled retries are stored in Redis Sorted Sets (`rq:delayed`) and promoted atomically via Lua scripts. Even if your worker crashes or restarts, scheduled retries are never lost!
-- ☠️ **Dead Letter Queue (DLQ)**: Automatically moves fatal errors or jobs exceeding `maxRetries` to `rq:dlq` with failure timestamps, attempts count, and reason.
-- 🔒 **Idempotency Protection**: Built-in at-most-once processing with optional TTL expiration to safely deduplicate incoming jobs without blocking subsequent retries.
+- ☠️ **Dead Letter Queue (DLQ)**: Automatically moves fatal errors, exhausted retries, or poison pill stalled jobs exceeding `maxStalledCount` to `rq:dlq` with failure timestamps and reasons.
+- 🔒 **Idempotency Protection**: Built-in at-most-once processing with optional TTL expiration to safely deduplicate incoming jobs without blocking subsequent retries or recovered crashed jobs.
 - ⚡ **Controlled Concurrency**: Configurable in-memory worker pool (`concurrency: N`) using an efficient single-fetcher loop with `Promise.race` backpressure to prevent Redis socket exhaustion.
-- 🔌 **Dual Connection Design**: Separates blocking reads (`BLPOP`) from command writes (`RPUSH`, `SET`, `ZADD`) so queue operations are never stalled by consumer polling.
+- 🔌 **Dual Connection Design**: Separates blocking reads (`BLMOVE`) from command writes (`RPUSH`, `SET`, `ZADD`) so queue operations are never stalled by consumer polling.
 - 🛑 **Graceful Shutdown**: Built-in `queue.close()` and `queue.stop()` to drain active in-flight jobs and disconnect cleanly without data loss.
 
 ---
@@ -58,12 +60,13 @@ Built for resilience, **`@mayurbhusare/resilient-queue`** provides **persistent 
 ```mermaid
 flowchart TD
     A[Producer: queue.enqueue] -->|RPUSH| B[Main Queue: rq:main]
-    B -->|BLPOP 1s| C[Worker Fetcher Loop]
+    B -->|Atomic BLMOVE 1s| C[Active Queue: rq:active]
+    C -->|Acquire Visibility Lock| L[Locks ZSET: rq:locks]
     C -->|Check Idempotency| D{Attempt == 0 & Key exists?}
-    D -- "Duplicate (SET NX fails)" --> X[Discard Duplicate]
-    D -- "Proceed" --> E[Execute Handler]
+    D -- "Duplicate (SET NX fails)" --> X[Discard & Clean Lock]
+    D -- "Proceed" --> E[Execute Handler & Heartbeat Lock]
     
-    E -->|Success| S[Job Completed]
+    E -->|Success| S[Job Completed & Clean Lock]
     E -->|Throws RetryableError| R{attempt <= maxRetries?}
     E -->|Throws FatalError / Unhandled Error| DLQ[Move to DLQ: rq:dlq]
     
@@ -71,15 +74,24 @@ flowchart TD
     R -- No --> DLQ
     
     Z -.->|Periodic Atomic Lua Promotion| B
+    
+    subgraph Stalled Job Recovery
+        L -.->|Lock Expired / Worker Dead?| SC{Stalled?}
+        SC -- Yes --> REC[Atomic Lua: Re-queue to rq:main or DLQ]
+        REC --> B
+        REC --> DLQ
+    end
 ```
 
 ### Lifecycle Highlights:
 1. **Enqueuing**: Jobs receive a unique UUID and are pushed to the Redis list `rq:main`.
-2. **Dequeuing**: Workers fetch jobs using Redis `BLPOP` (1-second timeout for non-blocking shutdown responsiveness).
-3. **Idempotency Check**: On `attempt === 0`, if an `idempotencyKey` is provided, Redis `SET NX` locks it. If it was already processed, the duplicate is skipped. Retries of the same job bypass this check.
-4. **Execution**: If the handler throws a `RetryableError` and attempts remain, the job is persisted to `rq:delayed` (a Redis ZSET).
-5. **Promotion**: An internal scheduler runs an atomic Lua script every 100ms that promotes due jobs from `rq:delayed` back to `rq:main`.
-6. **Dead Lettering**: If a job exhausts all retries or throws any non-retryable error (such as `FatalError`), it is routed immediately to `rq:dlq`.
+2. **Atomic Dequeuing**: Workers fetch jobs using Redis `BLMOVE` (Redis 6.2+) or `BRPOPLPUSH` into `rq:active`. Jobs are **never deleted from Redis during execution**.
+3. **Visibility Lock & Heartbeat**: When picked up, a lock is registered in `rq:locks` with an expiration timestamp (`Date.now() + lockDuration`). A lightweight background heartbeat continually renews the lock while the job is executing.
+4. **Stalled Job Recovery**: If a worker crashes or is killed (`SIGKILL`, OOM, reboot), its heartbeat stops. The queue's recovery scheduler inspects `rq:locks`, automatically re-queues abandoned jobs back into `rq:main`, or routes poison pills to `rq:dlq` if `maxStalledCount` is exceeded.
+5. **Idempotency Check**: On `attempt === 0` (and `stalledCount === 0`), if an `idempotencyKey` is provided, Redis `SET NX` locks it. If it was already processed, the duplicate is skipped. Retries and recovered jobs bypass this check.
+6. **Execution & Finalization**: Upon completion or failure, the job is atomically removed from `rq:active` and its visibility lock is released.
+7. **Crash-Durable Retries**: If the handler throws a `RetryableError` and attempts remain, the job is persisted to `rq:delayed` (a Redis ZSET) and promoted back via atomic Lua script.
+8. **Dead Lettering**: If a job exhausts all retries, throws a `FatalError`, or repeatedly crashes workers beyond `maxStalledCount`, it is routed immediately to `rq:dlq`.
 
 ---
 
@@ -218,15 +230,35 @@ The `job` argument provided to your handler contains the following structure:
 | `id` | `string` | Unique UUID v4 for the job. |
 | `data` | `any` | The payload passed during `enqueue()`. |
 | `attempt` | `number` | Number of retries already executed (`0` on initial try, `1`, `2`, ... on retries). |
+| `stalledCount` | `number \| undefined` | Number of times this job was recovered after a worker crash or heartbeat timeout. |
 | `idempotencyKey` | `string \| null` | The idempotency key, if provided. |
 | `ttlSeconds` | `number \| null` | The idempotency TTL in seconds, if specified. |
 | `createdAt` | `number` | Unix timestamp (in milliseconds) when the job was created. |
 | `lastError` | `string \| undefined` | The error message from the previous failed attempt (available on retries). |
 | `retriedAt` | `number \| undefined` | Unix timestamp (in milliseconds) of the most recent retry attempt. |
+| `lastStalledAt` | `number \| undefined` | Unix timestamp (in milliseconds) of the most recent stalled recovery. |
 
 ---
 
-### 4. Error Handling: Retryable vs. Fatal
+### 4. Stalled Job Protection & Worker Crash Recovery
+
+In standard Redis queues using `BLPOP`, if a worker process crashes (OOM killer, `SIGKILL`, hardware failure, unhandled rejection) while executing a job, **that job is lost forever**.
+
+`@mayurbhusare/resilient-queue` solves this with the **Reliable Queue Pattern + Active Visibility Heartbeat**:
+
+1. **Atomic Dequeue**: Jobs are moved atomically from `rq:main` to `rq:active` using `BLMOVE` (or `BRPOPLPUSH`). The job is **never removed from Redis during execution**.
+2. **Per-Dequeue Fencing Token**: Each worker execution generates a unique `lockToken` recorded in `rq:lock_tokens`. Stale workers that experienced network delays or GC pauses are **fenced**: their heartbeats and release calls cannot overwrite or delete a successor worker's lock or active queue entry!
+3. **Visibility Lock & Heartbeat**: The worker registers a lock in `rq:locks` (`Date.now() + lockDuration`). A non-blocking background heartbeat continually renews this lock as long as the worker holds the valid lease.
+4. **Surfacing Lease Loss via AbortSignal**: If a worker loses its lease (e.g. heartbeat timeout or recovery takeover), `job.isLeaseLost` is set to `true` and `job.signal` (standard `AbortSignal`) is automatically aborted. Handlers can pass `job.signal` to abort-aware APIs (like `fetch` or database clients) to cancel running operations immediately.
+5. **Automatic Recovery**: If the worker process dies or hangs, the heartbeat ceases. An internal recovery scheduler runs an atomic Lua script that revokes the expired token, re-queues abandoned jobs back into `rq:main`, and ensures no job is lost.
+6. **Poison Pill Protection**: If a malformed payload repeatedly crashes worker processes, the queue tracks `stalledCount`. If `stalledCount > maxStalledCount` (default: `1`), the job is safely diverted straight to `rq:dlq` with a diagnostic failure reason, preventing infinite crash loops!
+
+> [!WARNING]
+> **Idempotent Handlers Required**: While per-dequeue fencing tokens prevent a stale worker from corrupting Redis locks or active queue state, lease fencing **cannot forcibly terminate** arbitrary in-flight asynchronous code or external API calls already in flight. Your job handlers and downstream operations **must be designed to be idempotent** (or use an `idempotencyKey`) and should check `job.signal.aborted` or `job.signal.throwIfAborted()` where appropriate.
+
+---
+
+### 5. Error Handling: Retryable vs. Fatal
 
 `@mayurbhusare/resilient-queue` makes an intentional distinction between transient failures and non-recoverable errors:
 
@@ -253,7 +285,7 @@ queue.process(async (job) => {
 
 ---
 
-### 5. Crash-Durable Delayed Retries
+### 6. Crash-Durable Delayed Retries
 
 When a `RetryableError` is thrown, the retry delay is calculated using exponential backoff:
 
@@ -273,7 +305,7 @@ Instead of keeping delayed jobs in transient Node.js `setTimeout` memory timers,
 
 ---
 
-### 6. Dead Letter Queue (DLQ)
+### 7. Dead Letter Queue (DLQ)
 
 When a job either exceeds `maxRetries` or encounters a fatal non-retryable error, it is moved to the Dead Letter Queue:
 
@@ -318,7 +350,7 @@ async function checkDeadLetterQueue() {
 
 ---
 
-### 7. Idempotency & Expiration (TTL)
+### 8. Idempotency & Expiration (TTL)
 
 To guarantee **at-most-once** delivery across distributed producers and retries:
 
@@ -339,7 +371,7 @@ await queue.enqueue(
 
 ---
 
-### 8. Dual Redis Connection Architecture
+### 9. Dual Redis Connection Architecture
 
 `ResilientQueue` initializes two distinct Redis connections under the hood:
 
@@ -347,11 +379,13 @@ await queue.enqueue(
 graph LR
     subgraph ResilientQueue
         ProducerConn[Producer Connection\nWrites & Admin]
-        ConsumerConn[Consumer Connection\nDedicated BLPOP]
+        ConsumerConn[Consumer Connection\nDedicated BLMOVE]
     end
     
     subgraph Redis Server
         MainQueue[(rq:main)]
+        ActiveQueue[(rq:active)]
+        LocksSet[(rq:locks)]
         DelayedQueue[(rq:delayed)]
         DLQueue[(rq:dlq)]
     end
@@ -359,17 +393,18 @@ graph LR
     ProducerConn -->|RPUSH| MainQueue
     ProducerConn -->|ZADD / Lua| DelayedQueue
     ProducerConn -->|RPUSH| DLQueue
-    ConsumerConn -->|BLPOP 1s| MainQueue
+    ConsumerConn -->|BLMOVE 1s| ActiveQueue
+    ProducerConn -->|ZADD Heartbeat| LocksSet
 ```
 
 - **Producer Connection**: Dedicated to immediate, non-blocking commands (`RPUSH`, `SET`, `ZADD`, `eval`, `quit`).
-- **Consumer Connection**: Exclusively reserved for blocking reads (`BLPOP`).
+- **Consumer Connection**: Exclusively reserved for blocking reads (`BLMOVE` / `BRPOPLPUSH`).
 
-Because `BLPOP` holds the connection socket open while waiting for new jobs, isolating the producer ensures your application can always enqueue new jobs, promote retries, or write to the DLQ with zero blocking delay.
+Because blocking reads hold the connection socket open while waiting for new jobs, isolating the producer ensures your application can always enqueue new jobs, promote retries, or write to the DLQ with zero blocking delay.
 
 ---
 
-### 9. Graceful Shutdown
+### 10. Graceful Shutdown
 
 In production environments (Kubernetes, Docker, PM2, systemd), workers need to finish executing in-flight jobs when a termination signal is received:
 
@@ -406,6 +441,9 @@ Creates a new queue instance.
 | `maxRetries` | `number` | `3` | Maximum number of retries before routing a failed job to DLQ. |
 | `baseDelay` | `number` | `500` | Base retry delay in milliseconds for exponential backoff (`baseDelay * 2^attempt`). |
 | `keyPrefix` | `string` | `"rq"` | Namespace prefix for all Redis keys created by this queue. |
+| `stalledInterval` | `number` | `15000` | Interval in ms between stalled job recovery checks. |
+| `lockDuration` | `number` | `30000` | Visibility lock timeout in ms before an active job is considered abandoned. |
+| `maxStalledCount` | `number` | `1` | Max times a job can crash and be recovered before moving to DLQ (poison pill protection). |
 
 ---
 
@@ -476,9 +514,11 @@ All keys are namespaced by the configured `keyPrefix` (default: `rq`):
 
 | Redis Key | Type | Description |
 | :--- | :---: | :--- |
-| `<keyPrefix>:main` | `List` | Primary FIFO queue where new and promoted jobs await consumption via `BLPOP`. |
+| `<keyPrefix>:main` | `List` | Primary FIFO queue where new, promoted retries, and recovered jobs await consumption. |
+| `<keyPrefix>:active` | `List` | In-flight jobs currently being processed by workers (prevents data loss on crash). |
+| `<keyPrefix>:locks` | `Sorted Set` | Active job visibility locks periodically extended by worker heartbeats. |
 | `<keyPrefix>:delayed` | `Sorted Set` | Scheduled retries waiting for their delay window to elapse. Score is the Unix timestamp (ms). |
-| `<keyPrefix>:dlq` | `List` | Dead Letter Queue holding exhausted or fatal failed jobs with diagnostic metadata. |
+| `<keyPrefix>:dlq` | `List` | Dead Letter Queue holding exhausted, fatal, or poison pill failed jobs with diagnostic metadata. |
 | `<keyPrefix>:idempotency:<key>` | `String` | Idempotency lock stored via `SET NX` with optional TTL expiration (`EX`). |
 
 ---
