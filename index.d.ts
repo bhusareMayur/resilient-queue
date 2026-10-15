@@ -1,3 +1,5 @@
+import type { Redis, Cluster, RedisOptions, ClusterOptions, ClusterNode } from "ioredis";
+
 /**
  * Represents a queued job.
  */
@@ -69,13 +71,76 @@ export interface Job<T = any> {
 }
 
 /**
+ * Custom connection pair providing separate producer and consumer clients.
+ */
+export interface RedisConnectionPair {
+  producer: Redis | Cluster;
+  consumer?: Redis | Cluster;
+}
+
+/**
+ * Redis Cluster configuration.
+ */
+export interface ClusterConfig {
+  nodes: ClusterNode[];
+  options?: ClusterOptions;
+}
+
+/**
  * Configuration options for initializing ResilientQueue.
  */
 export interface QueueOptions {
   /**
    * Redis connection URL (e.g. "redis://127.0.0.1:6379").
+   * Preserved for backward compatibility.
    */
-  redisUrl: string;
+  redisUrl?: string;
+
+  /**
+   * Flexible Redis connection options:
+   * - Connection URL string (e.g. "redis://127.0.0.1:6379")
+   * - Standard ioredis options object (supports host, port, db, tls, sentinels, etc.)
+   * - Existing Redis or Cluster client instance
+   * - Redis Cluster configuration with nodes and options
+   * - Custom separate producer/consumer connection pair
+   */
+  redis?:
+    | string
+    | RedisOptions
+    | Redis
+    | Cluster
+    | ClusterConfig
+    | RedisConnectionPair;
+
+  /**
+   * Redis Cluster configuration or list of cluster nodes.
+   */
+  cluster?: ClusterNode[] | ClusterConfig;
+
+  /**
+   * List of Redis Cluster nodes.
+   */
+  clusterNodes?: ClusterNode[];
+
+  /**
+   * Options for Redis Cluster.
+   */
+  clusterOptions?: ClusterOptions;
+
+  /**
+   * Existing Redis or Cluster client instance.
+   */
+  client?: Redis | Cluster;
+
+  /**
+   * Producer connection or options.
+   */
+  producer?: Redis | Cluster | RedisOptions | string;
+
+  /**
+   * Consumer connection or options.
+   */
+  consumer?: Redis | Cluster | RedisOptions | string;
 
   /**
    * Maximum number of retry attempts before routing a failed job to the DLQ.
@@ -91,6 +156,11 @@ export interface QueueOptions {
 
   /**
    * Key namespace prefix for Redis keys (e.g. "rq" produces "rq:main", "rq:delayed", etc.).
+   *
+   * @remarks
+   * For Redis Cluster deployments, `keyPrefix` MUST contain a Redis hash tag (e.g. `"{rq}"`),
+   * ensuring that all multi-key Lua scripts and BLMOVE operations map to the same hash slot.
+   *
    * @default "rq"
    */
   keyPrefix?: string;

@@ -944,4 +944,289 @@ describe("Atomic Enqueue-Time Idempotency", () => {
     });
   });
 
+  describe("Redis Connection Flexibility & Client Ownership", () => {
+    let testQueue;
+    let externalRedis;
+    let redis;
 
+    beforeAll(async () => {
+      redis = new Redis(redisUrl);
+    });
+
+    beforeEach(async () => {
+      await redis.flushall();
+    });
+
+    afterEach(async () => {
+      if (testQueue) {
+        await testQueue.close();
+        testQueue = null;
+      }
+      if (externalRedis) {
+        if (externalRedis.status !== "end") {
+          await externalRedis.quit();
+        }
+        externalRedis = null;
+      }
+    });
+
+    afterAll(async () => {
+      await redis.quit();
+    });
+
+    test("initializes with redis URL string under redis option and processes jobs", async () => {
+      testQueue = new ResilientQueue({
+        redis: redisUrl,
+        keyPrefix: "test-url"
+      });
+
+      let processed = false;
+      testQueue.process(async (job) => {
+        processed = true;
+      });
+
+      await testQueue.enqueue({ task: "via-redis-url" });
+      await waitForCondition(async () => processed, 4000);
+
+      expect(processed).toBe(true);
+      expect(testQueue.producer !== testQueue.consumer).toBe(true);
+    });
+
+    test("initializes with standard ioredis options object and processes jobs", async () => {
+      testQueue = new ResilientQueue({
+        redis: { host: "127.0.0.1", port: 6379 },
+        keyPrefix: "test-opts"
+      });
+
+      let processedJob = null;
+      testQueue.process(async (job) => {
+        processedJob = job.data;
+      });
+
+      await testQueue.enqueue({ message: "ioredis-options" });
+      await waitForCondition(async () => processedJob !== null, 4000);
+
+      expect(processedJob).toEqual({ message: "ioredis-options" });
+      expect(testQueue.producer !== testQueue.consumer).toBe(true);
+    });
+
+    test("initializes with direct options on queue options object", async () => {
+      testQueue = new ResilientQueue({
+        host: "127.0.0.1",
+        port: 6379,
+        keyPrefix: "test-direct"
+      });
+
+      let processed = false;
+      testQueue.process(async () => {
+        processed = true;
+      });
+
+      await testQueue.enqueue({ task: "direct-options" });
+      await waitForCondition(async () => processed, 4000);
+
+      expect(processed).toBe(true);
+    });
+
+    test("supports Sentinel configuration options", async () => {
+      testQueue = new ResilientQueue({
+        redis: {
+          sentinels: [{ host: "127.0.0.1", port: 26379 }],
+          name: "mymaster",
+          lazyConnect: true
+        }
+      });
+
+      expect(testQueue.producer.options.name).toBe("mymaster");
+      expect(testQueue.consumer.options.name).toBe("mymaster");
+      expect(testQueue.producer !== testQueue.consumer).toBe(true);
+    });
+
+    test("supports TLS configuration options", async () => {
+      testQueue = new ResilientQueue({
+        redis: {
+          host: "127.0.0.1",
+          port: 6380,
+          tls: { rejectUnauthorized: false },
+          lazyConnect: true
+        }
+      });
+
+      expect(testQueue.producer.options.tls).toBeDefined();
+      expect(testQueue.consumer.options.tls).toBeDefined();
+      expect(testQueue.producer !== testQueue.consumer).toBe(true);
+    });
+
+    test("maintains separate producer and consumer connections when initialized with an existing client", async () => {
+      externalRedis = new Redis(redisUrl);
+      await externalRedis.ping();
+
+      testQueue = new ResilientQueue({
+        redis: externalRedis,
+        keyPrefix: "test-ext"
+      });
+
+      expect(testQueue.producer).toBe(externalRedis);
+      expect(testQueue.consumer).not.toBe(externalRedis);
+
+      let processed = false;
+      testQueue.process(async () => {
+        processed = true;
+      });
+
+      await testQueue.enqueue({ task: "existing-client" });
+      await waitForCondition(async () => processed, 4000);
+
+      expect(processed).toBe(true);
+    });
+
+    test("respects connection ownership: closes queue-owned consumer but never closes an externally owned client", async () => {
+      externalRedis = new Redis(redisUrl);
+      expect(await externalRedis.ping()).toBe("PONG");
+
+      testQueue = new ResilientQueue({
+        redis: externalRedis,
+        keyPrefix: "test-own"
+      });
+
+      const consumer = testQueue.consumer;
+
+      await testQueue.close();
+      testQueue = null;
+
+      // External client must remain connected and responsive
+      expect(await externalRedis.ping()).toBe("PONG");
+
+      // Queue-owned consumer must be closed
+      expect(consumer.status).toBe("end");
+    });
+
+    test("preserves externally owned clients when explicit producer and consumer pair is passed", async () => {
+      const extProducer = new Redis(redisUrl);
+      const extConsumer = new Redis(redisUrl, { maxRetriesPerRequest: null });
+
+      testQueue = new ResilientQueue({
+        producer: extProducer,
+        consumer: extConsumer,
+        keyPrefix: "test-pair"
+      });
+
+      expect(testQueue.producer).toBe(extProducer);
+      expect(testQueue.consumer).toBe(extConsumer);
+
+      await testQueue.close();
+      testQueue = null;
+
+      // Both external connections must still be alive
+      expect(await extProducer.ping()).toBe("PONG");
+      expect(await extConsumer.ping()).toBe("PONG");
+
+      await Promise.all([extProducer.quit(), extConsumer.quit()]);
+    });
+
+    test("creates separate consumer if same external client is passed for both producer and consumer", async () => {
+      externalRedis = new Redis(redisUrl);
+
+      testQueue = new ResilientQueue({
+        producer: externalRedis,
+        consumer: externalRedis,
+        keyPrefix: "test-same"
+      });
+
+      expect(testQueue.producer).toBe(externalRedis);
+      expect(testQueue.consumer).not.toBe(externalRedis);
+
+      await testQueue.close();
+      testQueue = null;
+
+      expect(await externalRedis.ping()).toBe("PONG");
+    });
+
+    test("supports Redis Cluster configuration with cluster nodes array", async () => {
+      testQueue = new ResilientQueue({
+        cluster: [{ host: "127.0.0.1", port: 7000 }],
+        clusterOptions: { lazyConnect: true }
+      });
+
+      expect(testQueue.producer).toBeInstanceOf(Redis.Cluster);
+      expect(testQueue.consumer).toBeInstanceOf(Redis.Cluster);
+      expect(testQueue.producer !== testQueue.consumer).toBe(true);
+    });
+
+    test("supports Redis Cluster configuration under redis.nodes", async () => {
+      testQueue = new ResilientQueue({
+        redis: {
+          nodes: [{ host: "127.0.0.1", port: 7000 }],
+          lazyConnect: true
+        }
+      });
+
+      expect(testQueue.producer).toBeInstanceOf(Redis.Cluster);
+      expect(testQueue.consumer).toBeInstanceOf(Redis.Cluster);
+      expect(testQueue.producer !== testQueue.consumer).toBe(true);
+    });
+
+    test("handles existing Redis Cluster client instance and preserves ownership", async () => {
+      const externalCluster = new Redis.Cluster([{ host: "127.0.0.1", port: 7000 }], { lazyConnect: true });
+
+      let extClusterQuitCalled = false;
+      externalCluster.quit = async () => {
+        extClusterQuitCalled = true;
+      };
+
+      testQueue = new ResilientQueue({
+        redis: externalCluster,
+        keyPrefix: "{test-ext-cluster}"
+      });
+
+      expect(testQueue.producer).toBe(externalCluster);
+      expect(testQueue.consumer).not.toBe(externalCluster);
+      expect(testQueue.consumer).toBeInstanceOf(Redis.Cluster);
+
+      let consumerQuitCalled = false;
+      testQueue.consumer.quit = async () => {
+        consumerQuitCalled = true;
+      };
+
+      await testQueue.close();
+      testQueue = null;
+
+      // External cluster instance must NOT be closed
+      expect(extClusterQuitCalled).toBe(false);
+      // Queue-owned duplicated consumer MUST be closed
+      expect(consumerQuitCalled).toBe(true);
+    });
+
+    test("throws an informative error when no Redis configuration is provided", () => {
+      expect(() => new ResilientQueue({})).toThrow(/redisUrl or redis options are required/);
+      expect(() => new ResilientQueue()).toThrow(/redisUrl or redis options are required/);
+    });
+
+    test("verifies Redis Cluster hash slot requirement for Lua scripts and multi-key commands", () => {
+      const calculateSlot = require("cluster-key-slot");
+
+      // Without hash tags: keys map to DIFFERENT slots, causing CROSSSLOT error in cluster
+      const unhashedMain = "rq:main";
+      const unhashedActive = "rq:active";
+      const unhashedDelayed = "rq:delayed";
+      expect(calculateSlot(unhashedMain)).not.toBe(calculateSlot(unhashedActive));
+      expect(calculateSlot(unhashedMain)).not.toBe(calculateSlot(unhashedDelayed));
+
+      // With hash tags: all queue keys map to the EXACT SAME slot, enabling multi-key scripts & BLMOVE
+      const hashedMain = "{rq}:main";
+      const hashedActive = "{rq}:active";
+      const hashedDelayed = "{rq}:delayed";
+      const hashedLocks = "{rq}:locks";
+      const hashedTokens = "{rq}:lock_tokens";
+      const hashedDLQ = "{rq}:dlq";
+      const hashedIdempotency = "{rq}:idempotency:order-123";
+
+      const targetSlot = calculateSlot(hashedMain);
+      expect(calculateSlot(hashedActive)).toBe(targetSlot);
+      expect(calculateSlot(hashedDelayed)).toBe(targetSlot);
+      expect(calculateSlot(hashedLocks)).toBe(targetSlot);
+      expect(calculateSlot(hashedTokens)).toBe(targetSlot);
+      expect(calculateSlot(hashedDLQ)).toBe(targetSlot);
+      expect(calculateSlot(hashedIdempotency)).toBe(targetSlot);
+    });
+  });
