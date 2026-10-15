@@ -75,7 +75,13 @@ class ResilientQueue {
    * Enqueue a new job.
    */
   async enqueue(data, options = {}) {
-    const { idempotencyKey, ttlSeconds } = options;
+    const { idempotencyKey, ttlSeconds } = options || {};
+
+    if (ttlSeconds !== undefined && ttlSeconds !== null) {
+      if (typeof ttlSeconds !== "number" || !Number.isInteger(ttlSeconds)) {
+        throw new Error("ttlSeconds must be an integer");
+      }
+    }
 
     const job = {
       id: uuidv4(),
@@ -83,16 +89,25 @@ class ResilientQueue {
       attempt: 0,
       stalledCount: 0,
       idempotencyKey: idempotencyKey || null,
-      ttlSeconds: ttlSeconds || null,
+      ttlSeconds: ttlSeconds ?? null,
       createdAt: Date.now()
     };
 
-    await this.producer.rpush(
-      this.mainQueueKey,
-      JSON.stringify(job)
-    );
+    if (!idempotencyKey) {
+      await this.producer.rpush(
+        this.mainQueueKey,
+        JSON.stringify(job)
+      );
 
-    return job.id;
+      return job.id;
+    }
+
+    return await this.idempotencyManager.registerAndEnqueue(
+      this.mainQueueKey,
+      idempotencyKey,
+      job,
+      ttlSeconds
+    );
   }
 
   /**
@@ -198,7 +213,8 @@ class ResilientQueue {
         shouldProceed =
           await this.idempotencyManager.shouldProcess(
             job.idempotencyKey,
-            job.ttlSeconds
+            job.ttlSeconds,
+            job.id
           );
       }
 
