@@ -285,5 +285,171 @@ await queue.close();
 
     expect(completed).toBe(true);
   });
+
+  test("in-flight jobs are tracked in rq:active and rq:locks then cleaned up upon completion", async () => {
+    let checkedInFlight = false;
+    let inFlightActiveCount = 0;
+    let inFlightLocksCount = 0;
+
+    queue.process(async () => {
+      inFlightActiveCount = await redis.llen("rq:active");
+      inFlightLocksCount = await redis.zcard("rq:locks");
+      checkedInFlight = true;
+    });
+
+    await new Promise((r) => setTimeout(r, 100));
+    await queue.enqueue({ test: "in-flight-tracking" });
+    await new Promise((r) => setTimeout(r, 400));
+
+    expect(checkedInFlight).toBe(true);
+    expect(inFlightActiveCount).toBe(1);
+    expect(inFlightLocksCount).toBe(1);
+
+    expect(await redis.llen("rq:active")).toBe(0);
+    expect(await redis.zcard("rq:locks")).toBe(0);
+  });
+
+  test("automatically recovers stalled job when worker crashes or stops heartbeating", async () => {
+    await queue.close();
+
+    queue = new ResilientQueue({
+      redisUrl,
+      maxRetries: 2,
+      baseDelay: 100,
+      lockDuration: 400,
+      stalledInterval: 100
+    });
+
+    const crashedJob = {
+      id: "crashed-job-1",
+      data: { action: "send-email" },
+      attempt: 0,
+      stalledCount: 0,
+      idempotencyKey: null,
+      ttlSeconds: null,
+      createdAt: Date.now()
+    };
+
+    await redis.rpush("rq:active", JSON.stringify(crashedJob));
+    await redis.zadd("rq:locks", Date.now() - 500, crashedJob.id);
+
+    let processedJob = null;
+    queue.process(async (job) => {
+      processedJob = job;
+    });
+
+    await new Promise((r) => setTimeout(r, 600));
+
+    expect(processedJob).not.toBeNull();
+    expect(processedJob.id).toBe("crashed-job-1");
+    expect(processedJob.stalledCount).toBe(1);
+    expect(await redis.llen("rq:active")).toBe(0);
+    expect(await redis.zcard("rq:locks")).toBe(0);
+  });
+
+  test("stalled job with idempotencyKey is not blocked by idempotency upon recovery", async () => {
+    await queue.close();
+
+    queue = new ResilientQueue({
+      redisUrl,
+      maxRetries: 2,
+      baseDelay: 100,
+      lockDuration: 400,
+      stalledInterval: 100
+    });
+
+    const idempotencyKey = "order-tx-999";
+    await redis.set(`rq:idempotency:${idempotencyKey}`, "1");
+
+    const crashedJob = {
+      id: "crashed-job-idempotent",
+      data: { orderId: 999 },
+      attempt: 0,
+      stalledCount: 0,
+      idempotencyKey,
+      ttlSeconds: 3600,
+      createdAt: Date.now()
+    };
+
+    await redis.rpush("rq:active", JSON.stringify(crashedJob));
+    await redis.zadd("rq:locks", Date.now() - 500, crashedJob.id);
+
+    let processed = false;
+    queue.process(async () => {
+      processed = true;
+    });
+
+    await new Promise((r) => setTimeout(r, 600));
+
+    expect(processed).toBe(true);
+    expect(await redis.llen("rq:active")).toBe(0);
+  });
+
+  test("routes poison pill job to DLQ when maxStalledCount is exceeded", async () => {
+    await queue.close();
+
+    queue = new ResilientQueue({
+      redisUrl,
+      maxRetries: 3,
+      baseDelay: 100,
+      lockDuration: 400,
+      stalledInterval: 100,
+      maxStalledCount: 1
+    });
+
+    const poisonJob = {
+      id: "poison-job-1",
+      data: { bad: "payload" },
+      attempt: 1,
+      stalledCount: 1,
+      idempotencyKey: null,
+      ttlSeconds: null,
+      createdAt: Date.now()
+    };
+
+    await redis.rpush("rq:active", JSON.stringify(poisonJob));
+    await redis.zadd("rq:locks", Date.now() - 500, poisonJob.id);
+
+    queue.process(async () => {});
+
+    await new Promise((r) => setTimeout(r, 600));
+
+    const dlqItems = await redis.lrange("rq:dlq", 0, -1);
+    expect(dlqItems.length).toBe(1);
+
+    const dlqJob = JSON.parse(dlqItems[0]);
+    expect(dlqJob.id).toBe("poison-job-1");
+    expect(dlqJob.stalledCount).toBe(2);
+    expect(dlqJob.failureReason).toContain("Job stalled more than maxStalledCount times");
+    expect(await redis.llen("rq:active")).toBe(0);
+    expect(await redis.zcard("rq:locks")).toBe(0);
+  });
+
+  test("heartbeat prevents active long-running jobs from being treated as stalled", async () => {
+    await queue.close();
+
+    queue = new ResilientQueue({
+      redisUrl,
+      maxRetries: 2,
+      baseDelay: 100,
+      lockDuration: 500,
+      stalledInterval: 150
+    });
+
+    let executionCount = 0;
+    queue.process(async () => {
+      executionCount++;
+      await new Promise((r) => setTimeout(r, 900));
+    });
+
+    await new Promise((r) => setTimeout(r, 50));
+    await queue.enqueue({ test: "long-runner" });
+
+    await new Promise((r) => setTimeout(r, 1200));
+
+    expect(executionCount).toBe(1);
+    expect(await redis.llen("rq:active")).toBe(0);
+    expect(await redis.zcard("rq:locks")).toBe(0);
+  });
 });
 

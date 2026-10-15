@@ -41,6 +41,16 @@ export interface Job<T = any> {
    * Unix timestamp (in milliseconds) of the most recent retry attempt.
    */
   retriedAt?: number;
+
+  /**
+   * The number of times this job stalled (due to worker crash or timeout) and was recovered.
+   */
+  stalledCount?: number;
+
+  /**
+   * Unix timestamp (in milliseconds) when the job was most recently recovered from a stalled state.
+   */
+  lastStalledAt?: number;
 }
 
 /**
@@ -69,6 +79,24 @@ export interface QueueOptions {
    * @default "rq"
    */
   keyPrefix?: string;
+
+  /**
+   * Interval in milliseconds at which the stalled job recovery scheduler runs.
+   * @default 15000
+   */
+  stalledInterval?: number;
+
+  /**
+   * Visibility timeout duration in milliseconds before an unacknowledged active job is considered stalled.
+   * @default 30000
+   */
+  lockDuration?: number;
+
+  /**
+   * Maximum times a job can stall (crashed worker) before being moved directly to DLQ.
+   * @default 1
+   */
+  maxStalledCount?: number;
 }
 
 /**
