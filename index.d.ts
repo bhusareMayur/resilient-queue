@@ -211,6 +211,85 @@ export interface ProcessOptions {
 }
 
 /**
+ * Represents a failed job stored in the Dead-Letter Queue (DLQ).
+ */
+export interface DLQJob<T = any> extends Job<T> {
+  /**
+   * Unix timestamp (in milliseconds) when the job failed and was moved to DLQ.
+   */
+  failedAt?: number;
+
+  /**
+   * Diagnostic reason or error message describing why the job failed.
+   */
+  failureReason?: string;
+
+  /**
+   * Set to true if this entry was malformed or corrupted in Redis.
+   */
+  corrupted?: boolean;
+
+  /**
+   * Raw unparsed string if the entry could not be parsed as valid JSON.
+   */
+  raw?: string;
+
+  /**
+   * Parsing error message if the entry was corrupted.
+   */
+  error?: string;
+}
+
+/**
+ * Options for querying the Dead-Letter Queue (DLQ).
+ */
+export interface DLQOptions {
+  /**
+   * Zero-based offset index to start retrieving jobs from.
+   * @default 0
+   */
+  start?: number;
+
+  /**
+   * Maximum number of jobs to retrieve.
+   * @default 50
+   */
+  limit?: number;
+
+  /**
+   * Sorting order: "asc" (oldest first, FIFO) or "desc" (newest first, LIFO).
+   * @default "asc"
+   */
+  order?: "asc" | "desc";
+}
+
+/**
+ * Result returned by getDLQ containing total count and paginated jobs.
+ */
+export interface DLQResult<T = any> {
+  /**
+   * Total number of jobs currently in the Dead-Letter Queue.
+   */
+  total: number;
+
+  /**
+   * Array of jobs retrieved for the requested page.
+   */
+  jobs: DLQJob<T>[];
+}
+
+/**
+ * Options for bulk retrying DLQ jobs.
+ */
+export interface RetryAllDLQOptions {
+  /**
+   * Maximum number of DLQ jobs to requeue in this batch.
+   * If omitted, requeues all eligible DLQ jobs.
+   */
+  limit?: number;
+}
+
+/**
  * Handler function invoked for each dequeued job.
  *
  * @remarks
@@ -259,6 +338,53 @@ export class ResilientQueue {
    * Stops worker processing and gracefully closes Redis connections.
    */
   close(): Promise<void>;
+
+  /**
+   * Retrieves a paginated list of failed jobs from the Dead-Letter Queue (DLQ).
+   * Safely handles corrupted JSON entries and supports ascending/descending order.
+   *
+   * @param options Pagination and ordering options.
+   * @returns Object containing the total DLQ count and array of jobs.
+   */
+  getDLQ<T = any>(options?: DLQOptions): Promise<DLQResult<T>>;
+
+  /**
+   * Returns the exact number of jobs currently waiting in the Dead-Letter Queue (DLQ).
+   */
+  getDLQCount(): Promise<number>;
+
+  /**
+   * Atomically moves a matching job from the DLQ back to the main queue for reprocessing,
+   * resetting retry and failure metadata.
+   *
+   * @param jobId UUID of the job to retry.
+   * @returns True if the job was found and retried, false otherwise.
+   */
+  retryDLQJob(jobId: string): Promise<boolean>;
+
+  /**
+   * Atomically moves jobs from the DLQ back to the main queue in controlled batches,
+   * resetting retry and failure metadata.
+   *
+   * @param options Batch size options.
+   * @returns Number of jobs successfully requeued.
+   */
+  retryAllDLQ(options?: RetryAllDLQOptions): Promise<number>;
+
+  /**
+   * Removes a specific failed job from the DLQ and cleans up associated metadata.
+   *
+   * @param jobId UUID of the job to remove.
+   * @returns True if the job was found and removed, false otherwise.
+   */
+  removeDLQJob(jobId: string): Promise<boolean>;
+
+  /**
+   * Purges all jobs from the Dead-Letter Queue (DLQ) and cleans up associated metadata.
+   *
+   * @returns Total number of jobs purged.
+   */
+  purgeDLQ(): Promise<number>;
 }
 
 /**

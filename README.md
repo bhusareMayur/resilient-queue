@@ -5,7 +5,7 @@
 
 [![npm version](https://img.shields.io/npm/v/@mayurbhusare/resilient-queue?style=flat-square&color=cb3837)](https://www.npmjs.com/package/@mayurbhusare/resilient-queue)
 [![license](https://img.shields.io/npm/l/@mayurbhusare/resilient-queue?style=flat-square&color=blue)](./LICENSE)
-[![tests](https://img.shields.io/badge/tests-44%20passed-brightgreen?style=flat-square)](https://github.com/bhusareMayur/resilient-queue)
+[![tests](https://img.shields.io/badge/tests-58%20passed-brightgreen?style=flat-square)](https://github.com/bhusareMayur/resilient-queue)
 
 A lightweight, production-grade, Redis-backed job queue for Node.js.
 
@@ -18,7 +18,7 @@ Built for resilience, **`@mayurbhusare/resilient-queue`** provides crash-durable
 - **Crash-Proof Job Durability**: Uses atomic `BLMOVE` (with `BRPOPLPUSH` fallback) to move active jobs to `rq:active`. In-flight jobs are never deleted from Redis during processing. If a worker crashes, an active visibility heartbeat detects the abandoned job and safely recovers it.
 - **Fencing Tokens & Lease Revocation**: Per-dequeue fencing tokens (`lockToken`) protect against stale workers renewing or releasing successor workers' locks. Lease loss is surfaced to handlers via `job.signal` (`AbortSignal`) and `job.isLeaseLost`.
 - **Crash-Durable Retries**: Scheduled retries are persisted in a Redis Sorted Set (`rq:delayed`) and promoted via atomic Lua scripts, surviving worker restarts and server reboots.
-- **Dead-Letter Queue (DLQ)**: Automatically moves non-retryable errors, exhausted retries, or repeatedly crashing poison pills exceeding `maxStalledCount` to `rq:dlq` with failure diagnostics.
+- **Native Dead-Letter Queue (DLQ) Management**: Automatically moves non-retryable errors, exhausted retries, or repeatedly crashing poison pills exceeding `maxStalledCount` to `rq:dlq` with failure diagnostics. Provides native atomic APIs to inspect (`getDLQ`, `getDLQCount`), atomically retry single or batch jobs with reset failure metadata (`retryDLQJob`, `retryAllDLQ`), remove (`removeDLQJob`), or purge (`purgeDLQ`) with full Redis Cluster hash-slot support and corrupted JSON safety.
 - **Atomic Enqueue-Time Idempotency**: Deduplicates incoming jobs at enqueue time via an atomic Lua script with optional TTL expiration (`ttlSeconds`), returning the existing job ID without creating duplicate queue entries.
 - **Controlled In-Memory Concurrency**: Single-consumer worker pool (`concurrency: N`) using `Promise.race` backpressure, avoiding Redis connection bottlenecks and socket exhaustion.
 - **Flexible Redis Topologies**: Connect via Redis URL, standard `ioredis` options (including TLS and Sentinel), Redis Cluster, or existing client instances with connection ownership tracking.
@@ -103,6 +103,41 @@ main().catch(console.error);
 ```
 
 For more detailed workflows, see the [Getting Started Guide](./docs/getting-started.md) and [Code Examples](./docs/examples.md).
+
+---
+
+## Dead-Letter Queue (DLQ) Management
+
+`ResilientQueue` provides first-class native APIs for dead-letter queue operations:
+
+```javascript
+// 1. Get exact DLQ count
+const count = await queue.getDLQCount();
+console.log(`Failed jobs in DLQ: ${count}`);
+
+// 2. Paginate and inspect DLQ jobs (supports asc/desc ordering and safe corrupted JSON handling)
+const { total, jobs } = await queue.getDLQ({ start: 0, limit: 10, order: "desc" });
+for (const job of jobs) {
+  console.log(`[DLQ Job ${job.id}] Failed at: ${new Date(job.failedAt)}, Reason: ${job.failureReason}`);
+}
+
+// 3. Atomically retry a specific failed job (resets retry/failure metadata back to 0)
+const retried = await queue.retryDLQJob("550e8400-e29b-41d4-a716-446655440000");
+if (retried) {
+  console.log("Job moved back to main queue for reprocessing");
+}
+
+// 4. Atomically retry all failed jobs in controlled batches
+const requeuedCount = await queue.retryAllDLQ({ limit: 50 });
+console.log(`Requeued ${requeuedCount} jobs from DLQ`);
+
+// 5. Remove a specific job from DLQ (cleans associated failure metadata)
+const removed = await queue.removeDLQJob("550e8400-e29b-41d4-a716-446655440000");
+
+// 6. Purge entire DLQ and clean associated metadata
+const purgedCount = await queue.purgeDLQ();
+console.log(`Purged ${purgedCount} jobs from DLQ`);
+```
 
 ---
 

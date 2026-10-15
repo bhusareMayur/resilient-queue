@@ -421,6 +421,47 @@ class ResilientQueue {
     return await this.stalledJobManager.getStalledMetadata(jobId);
   }
 
+  /**
+   * Retrieves paginated DLQ jobs.
+   */
+  async getDLQ(options = {}) {
+    return await this.dlqManager.getDLQ(options);
+  }
+
+  /**
+   * Returns exact count of DLQ jobs.
+   */
+  async getDLQCount() {
+    return await this.dlqManager.getDLQCount();
+  }
+
+  /**
+   * Atomically retries a specific DLQ job by moving it back to the main queue.
+   */
+  async retryDLQJob(jobId) {
+    return await this.dlqManager.retryDLQJob(jobId);
+  }
+
+  /**
+   * Atomically retries DLQ jobs in batches by moving them back to the main queue.
+   */
+  async retryAllDLQ(options = {}) {
+    return await this.dlqManager.retryAllDLQ(options);
+  }
+
+  /**
+   * Removes a specific failed job from DLQ.
+   */
+  async removeDLQJob(jobId) {
+    return await this.dlqManager.removeDLQJob(jobId);
+  }
+
+  /**
+   * Purges all jobs from DLQ and cleans associated metadata.
+   */
+  async purgeDLQ() {
+    return await this.dlqManager.purgeDLQ();
+  }
 }
 
 module.exports = ResilientQueue;
