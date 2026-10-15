@@ -7,7 +7,7 @@
 [![license](https://img.shields.io/npm/l/@mayurbhusare/resilient-queue?style=flat-square&color=blue)](./LICENSE)
 [![downloads](https://img.shields.io/npm/dt/@mayurbhusare/resilient-queue?style=flat-square&color=green)](https://www.npmjs.com/package/@mayurbhusare/resilient-queue)
 [![node](https://img.shields.io/node/v/@mayurbhusare/resilient-queue?style=flat-square)](https://nodejs.org)
-[![tests](https://img.shields.io/badge/tests-30%20passed-brightgreen?style=flat-square&logo=jest)](https://github.com/bhusareMayur/resilient-queue)
+[![tests](https://img.shields.io/badge/tests-44%20passed-brightgreen?style=flat-square&logo=jest)](https://github.com/bhusareMayur/resilient-queue)
 [![redis](https://img.shields.io/badge/redis-backed-red?style=flat-square&logo=redis)](https://redis.io)
 
 A lightweight, production-grade, Redis-backed job queue for Node.js.
@@ -50,7 +50,7 @@ Built for resilience, **`@mayurbhusare/resilient-queue`** provides **crash-proof
 - ☠️ **Dead Letter Queue (DLQ)**: Automatically moves fatal errors, exhausted retries, or poison pill stalled jobs exceeding `maxStalledCount` to `rq:dlq` with failure timestamps and reasons.
 - 🔒 **Idempotency Protection**: Built-in at-most-once processing with optional TTL expiration to safely deduplicate incoming jobs without blocking subsequent retries or recovered crashed jobs.
 - ⚡ **Controlled Concurrency**: Configurable in-memory worker pool (`concurrency: N`) using an efficient single-fetcher loop with `Promise.race` backpressure to prevent Redis socket exhaustion.
-- 🔌 **Dual Connection Design**: Separates blocking reads (`BLMOVE`) from command writes (`RPUSH`, `SET`, `ZADD`) so queue operations are never stalled by consumer polling.
+- 🔌 **Flexible Redis Connections & Dual Connection Design**: Connect via Redis URL, standard `ioredis` options (including TLS and Sentinel), Redis Cluster, or existing client instances with safe connection ownership management and dedicated producer/consumer connection separation.
 - 🛑 **Graceful Shutdown**: Built-in `queue.close()` and `queue.stop()` to drain active in-flight jobs and disconnect cleanly without data loss.
 
 ---
@@ -380,7 +380,7 @@ const jobId = await queue.enqueue(
 
 ---
 
-### 9. Dual Redis Connection Architecture
+### 9. Dual Redis Connection Architecture & Flexible Connections
 
 `ResilientQueue` initializes two distinct Redis connections under the hood:
 
@@ -411,6 +411,77 @@ graph LR
 
 Because blocking reads hold the connection socket open while waiting for new jobs, isolating the producer ensures your application can always enqueue new jobs, promote retries, or write to the DLQ with zero blocking delay.
 
+#### Flexible Connection Options
+
+`ResilientQueue` supports standard Redis connection formats, secure endpoints, high-availability deployments, and pre-existing client instances:
+
+```javascript
+// 1. Connection URL string (backward compatible with redisUrl)
+const queue = new ResilientQueue({
+  redis: "redis://127.0.0.1:6379"
+});
+
+// 2. Standard ioredis options (including TLS)
+const queue = new ResilientQueue({
+  redis: {
+    host: "redis.internal.example.com",
+    port: 6380,
+    password: "auth-token",
+    tls: { rejectUnauthorized: true }
+  }
+});
+
+// 3. Redis Sentinel High Availability
+const queue = new ResilientQueue({
+  redis: {
+    sentinels: [
+      { host: "sentinel-1.example.com", port: 26379 },
+      { host: "sentinel-2.example.com", port: 26379 }
+    ],
+    name: "mymaster"
+  }
+});
+
+// 4. Existing Redis Client Instance
+const existingClient = new Redis("redis://127.0.0.1:6379");
+const queue = new ResilientQueue({
+  redis: existingClient // Producer uses existingClient; Consumer is automatically duplicated
+});
+
+// 5. Redis Cluster Configuration
+const queue = new ResilientQueue({
+  cluster: [
+    { host: "10.0.0.1", port: 7000 },
+    { host: "10.0.0.2", port: 7000 }
+  ],
+  keyPrefix: "{rq}" // REQUIRED for Redis Cluster (see Hash Slot Requirements below)
+});
+```
+
+#### Connection Ownership & Lifecycle
+
+`ResilientQueue` strictly respects connection ownership:
+- **Queue-Owned Connections**: Connections created by the library (via URL, connection options, cluster nodes, or duplicate calls) are automatically disconnected when `queue.close()` is called.
+- **Externally Owned Clients**: If you pass an existing `Redis` or `Cluster` instance into `ResilientQueue` (e.g. `redis: existingClient`), the library will **never close** your external client. When `queue.close()` runs, only the internal duplicated consumer is closed, leaving your external client open and responsive for the rest of your application.
+
+#### Redis Cluster Support & Limitations
+
+`ResilientQueue` supports Redis Cluster configurations, but requires single-slot key locality:
+
+> [!WARNING]
+> **Redis Cluster Hash Slot Requirement**: ResilientQueue uses atomic multi-key Lua scripts (`eval`) and atomic list migrations (`BLMOVE`). In Redis Cluster, all keys evaluated within a single script or command **must map to the exact same hash slot**.
+> 
+> When configuring ResilientQueue on Redis Cluster, you **must wrap the key prefix in a Redis hash tag `{...}`**, for example:
+> ```javascript
+> const queue = new ResilientQueue({
+>   cluster: [{ host: "127.0.0.1", port: 7000 }],
+>   keyPrefix: "{my-queue}" // Hashes all queue keys ({my-queue}:main, {my-queue}:active, etc.) to the same slot
+> });
+> ```
+> Without hash tags in `keyPrefix`, Redis Cluster will reject operations with `CROSSSLOT Keys in request don't hash to the same slot`.
+>
+> **Multi-Shard Limitation**: Using a hash tag guarantees transactional atomicity by pinning all keys for that specific queue to a single Redis Cluster node/shard. A single queue cannot be partitioned or distributed across multiple cluster shards.
+
 ---
 
 ### 10. Graceful Shutdown
@@ -422,7 +493,7 @@ In production environments (Kubernetes, Docker, PM2, systemd), workers need to f
 async function handleShutdown() {
   console.log("Shutting down worker gracefully...");
   
-  // Stops fetching new jobs, awaits in-flight jobs, and closes Redis connections
+  // Stops fetching new jobs, awaits in-flight jobs, and closes queue-owned Redis connections
   await queue.close();
   
   console.log("Worker closed cleanly.");
@@ -434,7 +505,7 @@ process.on("SIGINT", handleShutdown);
 ```
 
 - `queue.stop()`: Halts job consumption, pauses retry schedulers, and waits for all in-flight jobs to settle.
-- `queue.close()`: Executes `queue.stop()` and safely closes both Redis connections (`producer.quit()` and `consumer.quit()`).
+- `queue.close()`: Executes `queue.stop()` and safely closes queue-owned Redis connections (`producer.quit()` and `consumer.quit()`). Externally provided clients are left untouched.
 
 ---
 
@@ -446,10 +517,17 @@ Creates a new queue instance.
 
 | Option | Type | Default | Description |
 | :--- | :--- | :--- | :--- |
-| `redisUrl` | `string` | *(Required)* | Redis connection URL (e.g. `"redis://127.0.0.1:6379"`). |
+| `redis` | `string \| object \| Redis \| Cluster` | *(Optional)* | Connection URL string, standard `ioredis` options object, existing Redis/Cluster client instance, or cluster configuration. |
+| `redisUrl` | `string` | *(Optional)* | Redis connection URL (e.g. `"redis://127.0.0.1:6379"`). Preserved for backward compatibility. |
+| `cluster` | `Array \| object` | *(Optional)* | Redis Cluster node array `[{ host, port }]` or `{ nodes, options }` configuration object. |
+| `clusterNodes` | `Array` | *(Optional)* | Array of Redis Cluster nodes. |
+| `clusterOptions` | `object` | *(Optional)* | Configuration options for Redis Cluster. |
+| `client` | `Redis \| Cluster` | *(Optional)* | Pre-existing Redis or Cluster client instance. |
+| `producer` | `Redis \| Cluster \| object \| string` | *(Optional)* | Explicit client instance or connection options for the producer connection. |
+| `consumer` | `Redis \| Cluster \| object \| string` | *(Optional)* | Explicit client instance or connection options for the blocking consumer connection. |
 | `maxRetries` | `number` | `3` | Maximum number of retries before routing a failed job to DLQ. |
 | `baseDelay` | `number` | `500` | Base retry delay in milliseconds for exponential backoff (`baseDelay * 2^attempt`). |
-| `keyPrefix` | `string` | `"rq"` | Namespace prefix for all Redis keys created by this queue. |
+| `keyPrefix` | `string` | `"rq"` | Namespace prefix for Redis keys. **Note:** On Redis Cluster, must contain a hash tag like `"{rq}"` to avoid cross-slot errors. |
 | `stalledInterval` | `number` | `15000` | Interval in ms between stalled job recovery checks. |
 | `lockDuration` | `number` | `30000` | Visibility lock timeout in ms before an active job is considered abandoned. |
 | `maxStalledCount` | `number` | `1` | Max times a job can crash and be recovered before moving to DLQ (poison pill protection). |

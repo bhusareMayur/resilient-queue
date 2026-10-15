@@ -13,6 +13,14 @@ class ResilientQueue {
   constructor(options = {}) {
     const {
       redisUrl,
+      redis,
+      cluster,
+      clusterNodes,
+      clusterOptions,
+      client,
+      connection,
+      producer,
+      consumer,
       maxRetries = 3,
       baseDelay = 500,
       keyPrefix = "rq",
@@ -21,8 +29,20 @@ class ResilientQueue {
       maxStalledCount = 1
     } = options;
 
-    if (!redisUrl) {
-      throw new Error("redisUrl is required to initialize ResilientQueue");
+    if (
+      !redisUrl &&
+      !redis &&
+      !cluster &&
+      !clusterNodes &&
+      !client &&
+      !connection &&
+      !producer &&
+      !consumer &&
+      !options.host &&
+      !options.port &&
+      !options.sentinels
+    ) {
+      throw new Error("redisUrl or redis options are required to initialize ResilientQueue");
     }
 
     this.keyPrefix = keyPrefix;
@@ -38,10 +58,10 @@ class ResilientQueue {
     this.fetcherPromise = null;
     this.workers = [];
 
-  this.redisClientWrapper = new RedisClient(redisUrl);
+    this.redisClientWrapper = new RedisClient(options);
 
-  this.producer = this.redisClientWrapper.getProducer();
-  this.consumer = this.redisClientWrapper.getConsumer();
+    this.producer = this.redisClientWrapper.getProducer();
+    this.consumer = this.redisClientWrapper.getConsumer();
 
     this.idempotencyManager = new IdempotencyManager(
       this.producer,
