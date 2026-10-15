@@ -5,11 +5,11 @@
 
 [![npm version](https://img.shields.io/npm/v/@mayurbhusare/resilient-queue?style=flat-square&color=cb3837)](https://www.npmjs.com/package/@mayurbhusare/resilient-queue)
 [![license](https://img.shields.io/npm/l/@mayurbhusare/resilient-queue?style=flat-square&color=blue)](./LICENSE)
-[![tests](https://img.shields.io/badge/tests-58%20passed-brightgreen?style=flat-square)](https://github.com/bhusareMayur/resilient-queue)
+[![tests](https://img.shields.io/badge/tests-77%20passed-brightgreen?style=flat-square)](https://github.com/bhusareMayur/resilient-queue)
 
 A lightweight, production-grade, Redis-backed job queue for Node.js.
 
-Built for resilience, **`@mayurbhusare/resilient-queue`** provides crash-durable in-flight job durability (stalled job recovery), persistent exponential backoff retries, Dead-Letter Queue (DLQ) routing, atomic enqueue-time idempotency guarantees, in-memory worker concurrency, and graceful shutdown — with zero framework bloat and only two lean dependencies (`ioredis` and `uuid`).
+Built for resilience, **`@mayurbhusare/resilient-queue`** provides crash-durable in-flight job durability (stalled job recovery), persistent exponential backoff retries, Dead-Letter Queue (DLQ) routing, atomic enqueue-time idempotency guarantees, scheduled delayed jobs, high-throughput pipeline batch enqueuing (`enqueueMany`), in-memory worker concurrency, and graceful shutdown — with zero framework bloat and only two lean dependencies (`ioredis` and `uuid`).
 
 ---
 
@@ -17,6 +17,8 @@ Built for resilience, **`@mayurbhusare/resilient-queue`** provides crash-durable
 
 - **Crash-Proof Job Durability**: Uses atomic `BLMOVE` (with `BRPOPLPUSH` fallback) to move active jobs to `rq:active`. In-flight jobs are never deleted from Redis during processing. If a worker crashes, an active visibility heartbeat detects the abandoned job and safely recovers it.
 - **Fencing Tokens & Lease Revocation**: Per-dequeue fencing tokens (`lockToken`) protect against stale workers renewing or releasing successor workers' locks. Lease loss is surfaced to handlers via `job.signal` (`AbortSignal`) and `job.isLeaseLost`.
+- **Scheduled Delayed Jobs**: Schedule jobs directly from `enqueue()` using `{ delay: ms }` or `{ runAt: new Date(...) }` backed by Redis sorted sets (`rq:delayed`) and atomic Lua promotion.
+- **High-Throughput Batch Enqueuing (`enqueueMany`)**: Enqueue thousands of jobs in a single network round-trip using an `ioredis` pipeline for 50x–100x throughput boost.
 - **Crash-Durable Retries**: Scheduled retries are persisted in a Redis Sorted Set (`rq:delayed`) and promoted via atomic Lua scripts, surviving worker restarts and server reboots.
 - **Native Dead-Letter Queue (DLQ) Management**: Automatically moves non-retryable errors, exhausted retries, or repeatedly crashing poison pills exceeding `maxStalledCount` to `rq:dlq` with failure diagnostics. Provides native atomic APIs to inspect (`getDLQ`, `getDLQCount`), atomically retry single or batch jobs with reset failure metadata (`retryDLQJob`, `retryAllDLQ`), remove (`removeDLQJob`), or purge (`purgeDLQ`) with full Redis Cluster hash-slot support and corrupted JSON safety.
 - **Atomic Enqueue-Time Idempotency**: Deduplicates incoming jobs at enqueue time via an atomic Lua script with optional TTL expiration (`ttlSeconds`), returning the existing job ID without creating duplicate queue entries.
@@ -91,12 +93,26 @@ queue.process(async (job) => {
 
 // 3. Enqueue Jobs (Producer)
 async function main() {
+  // Standard idempotent job
   const jobId = await queue.enqueue(
     { email: "user@example.com", template: "welcome" },
     { idempotencyKey: "welcome-user-123", ttlSeconds: 86400 }
   );
 
-  console.log("Enqueued job ID:", jobId);
+  // Scheduled delayed job (5 seconds delay or specific Date)
+  const delayedJobId = await queue.enqueue(
+    { email: "reminder@example.com" },
+    { delay: 5000 } // Or runAt: new Date(Date.now() + 60000)
+  );
+
+  // High-throughput batch enqueuing via ioredis pipeline (50x–100x throughput boost)
+  const batchIds = await queue.enqueueMany([
+    { data: { orderId: 1 } },
+    { data: { orderId: 2 } },
+    { data: { orderId: 3 } },
+  ]);
+
+  console.log("Enqueued job IDs:", { jobId, delayedJobId, batchIds });
 }
 
 main().catch(console.error);
