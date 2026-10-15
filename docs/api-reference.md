@@ -14,11 +14,21 @@ This document provides a comprehensive reference for all exported classes, metho
   - [queue.stop()](#queuestop)
   - [queue.close()](#queueclose)
   - [queue.getJobMetadata(jobId)](#queuegetjobmetadatajobid)
+  - [queue.getDLQ([options])](#queuegetdlqoptions)
+  - [queue.getDLQCount()](#queuegetdlqcount)
+  - [queue.retryDLQJob(jobId)](#queueretrydlqjobjobid)
+  - [queue.retryAllDLQ([options])](#queueretryalldlqoptions)
+  - [queue.removeDLQJob(jobId)](#queueremovedlqjobjobid)
+  - [queue.purgeDLQ()](#queuepurgedlq)
 - [Error Classes](#error-classes)
   - [RetryableError](#retryableerror)
   - [FatalError](#fatalerror)
 - [TypeScript Types & Interfaces](#typescript-types-interfaces)
   - [Job<T>](#jobt)
+  - [DLQJob<T>](#dlqjobt)
+  - [DLQOptions](#dlqoptions)
+  - [DLQResult<T>](#dlqresultt)
+  - [RetryAllDLQOptions](#retryalldlqoptions)
   - [QueueOptions](#queueoptions)
   - [EnqueueOptions](#enqueueoptions)
   - [ProcessOptions](#processoptions)
@@ -199,6 +209,139 @@ if (meta) {
 
 ---
 
+### `queue.getDLQ([options])`
+
+Retrieves a paginated list of failed jobs from the Dead-Letter Queue (`<keyPrefix>:dlq`). Supports ascending and descending order, and safely handles corrupted JSON entries without throwing.
+
+#### Parameters
+
+- `options` (`DLQOptions`, optional):
+  - `start` (`number`, optional): Zero-based offset index to start retrieving jobs from. Default: `0`.
+  - `limit` (`number`, optional): Maximum number of jobs to retrieve. Default: `50`.
+  - `order` (`"asc" | "desc"`, optional): Sort order. `"asc"` returns oldest failed jobs first (FIFO); `"desc"` returns newest failed jobs first (LIFO). Default: `"asc"`.
+
+#### Returns
+
+- `Promise<DLQResult>`: An object containing:
+  - `total` (`number`): The exact total number of jobs currently in the DLQ.
+  - `jobs` (`DLQJob[]`): Array of failed jobs for the requested page. If an entry in Redis contains corrupted JSON, it is returned as `{ id: null, raw: string, corrupted: true, error: string }`.
+
+#### Example
+
+```javascript
+const { total, jobs } = await queue.getDLQ({ start: 0, limit: 10, order: "desc" });
+console.log(`Total failed jobs: ${total}`);
+for (const job of jobs) {
+  if (job.corrupted) {
+    console.error("Corrupted DLQ payload:", job.raw);
+  } else {
+    console.log(`Failed job ${job.id}: ${job.failureReason}`);
+  }
+}
+```
+
+---
+
+### `queue.getDLQCount()`
+
+Returns the exact number of failed jobs currently stored in the Dead-Letter Queue.
+
+#### Returns
+
+- `Promise<number>`: The total count of entries in the DLQ list.
+
+#### Example
+
+```javascript
+const count = await queue.getDLQCount();
+console.log(`DLQ has ${count} failed jobs`);
+```
+
+---
+
+### `queue.retryDLQJob(jobId)`
+
+Atomically moves one matching failed job from the Dead-Letter Queue back to the tail of the main queue (`<keyPrefix>:main`), resetting retry attempts and failure metadata back to 0.
+
+#### Parameters
+
+- `jobId` (`string`): The UUID of the failed job to retry.
+
+#### Returns
+
+- `Promise<boolean>`: Resolves to `true` if the job was found in the DLQ and successfully moved back to the main queue; resolves to `false` if the job was not found.
+
+#### Example
+
+```javascript
+const retried = await queue.retryDLQJob("550e8400-e29b-41d4-a716-446655440000");
+if (retried) {
+  console.log("Job moved back to main queue for reprocessing");
+}
+```
+
+---
+
+### `queue.retryAllDLQ([options])`
+
+Atomically requeues failed jobs from the Dead-Letter Queue back to the main queue in controlled batches, resetting retry attempts and failure metadata back to 0. Corrupted entries are safely skipped and retained in the DLQ.
+
+#### Parameters
+
+- `options` (`RetryAllDLQOptions`, optional):
+  - `limit` (`number`, optional): Maximum number of failed jobs to requeue in this batch. If omitted, all eligible jobs in the DLQ are requeued.
+
+#### Returns
+
+- `Promise<number>`: The number of jobs successfully requeued to the main queue.
+
+#### Example
+
+```javascript
+// Requeue in controlled batches of 50
+const requeued = await queue.retryAllDLQ({ limit: 50 });
+console.log(`Requeued ${requeued} jobs`);
+```
+
+---
+
+### `queue.removeDLQJob(jobId)`
+
+Removes a specific failed job from the Dead-Letter Queue and cleans up its associated metadata in `<keyPrefix>:stalled_meta`.
+
+#### Parameters
+
+- `jobId` (`string`): The UUID of the failed job to remove.
+
+#### Returns
+
+- `Promise<boolean>`: Resolves to `true` if the job was found and removed; `false` otherwise.
+
+#### Example
+
+```javascript
+const removed = await queue.removeDLQJob("550e8400-e29b-41d4-a716-446655440000");
+```
+
+---
+
+### `queue.purgeDLQ()`
+
+Atomically clears the entire Dead-Letter Queue and cleans associated metadata in `<keyPrefix>:stalled_meta`.
+
+#### Returns
+
+- `Promise<number>`: The total number of jobs purged from the DLQ.
+
+#### Example
+
+```javascript
+const purged = await queue.purgeDLQ();
+console.log(`Purged ${purged} failed jobs from DLQ`);
+```
+
+---
+
 ## Error Classes
 
 ### `RetryableError`
@@ -289,6 +432,79 @@ export interface Job<T = any> {
 | `signal` | `AbortSignal \| undefined` | Standard `AbortSignal` triggered if the job lease is lost or recovered by another worker. |
 | `isLeaseLost` | `boolean \| undefined` | Boolean indicating whether this worker's visibility lease has expired or was revoked. |
 | `lockToken` | `string \| undefined` | Per-dequeue fencing token identifying this execution lease. |
+
+---
+
+### `DLQJob<T>`
+
+Represents a failed job stored in the Dead-Letter Queue. Extends `Job<T>`.
+
+```typescript
+export interface DLQJob<T = any> extends Job<T> {
+  failedAt?: number;
+  failureReason?: string;
+  corrupted?: boolean;
+  raw?: string;
+  error?: string;
+}
+```
+
+| Field | Type | Description |
+| :--- | :--- | :--- |
+| `failedAt` | `number \| undefined` | Unix timestamp in milliseconds when the job failed and was moved to DLQ. |
+| `failureReason` | `string \| undefined` | Failure error message or diagnostic reason. |
+| `corrupted` | `boolean \| undefined` | Flag set to `true` if this DLQ entry was malformed JSON in Redis. |
+| `raw` | `string \| undefined` | Pristine unparsed string if the entry could not be parsed as JSON. |
+| `error` | `string \| undefined` | Parse error message if corrupted. |
+
+---
+
+### `DLQOptions`
+
+Options for querying the Dead-Letter Queue.
+
+```typescript
+export interface DLQOptions {
+  start?: number;
+  limit?: number;
+  order?: "asc" | "desc";
+}
+```
+
+| Field | Type | Default | Description |
+| :--- | :--- | :--- | :--- |
+| `start` | `number` | `0` | Zero-based offset index to start retrieving jobs from. |
+| `limit` | `number` | `50` | Maximum number of jobs to retrieve. |
+| `order` | `"asc" \| "desc"` | `"asc"` | Sort order: `"asc"` (oldest first, FIFO) or `"desc"` (newest first, LIFO). |
+
+---
+
+### `DLQResult<T>`
+
+Object returned by `queue.getDLQ()`.
+
+```typescript
+export interface DLQResult<T = any> {
+  total: number;
+  jobs: DLQJob<T>[];
+}
+```
+
+---
+
+### `RetryAllDLQOptions`
+
+Options for batch requeuing DLQ jobs.
+
+```typescript
+export interface RetryAllDLQOptions {
+  limit?: number;
+}
+```
+
+| Field | Type | Default | Description |
+| :--- | :--- | :--- | :--- |
+| `limit` | `number` | All | Maximum number of failed jobs to requeue in this batch. |
 
 ---
 

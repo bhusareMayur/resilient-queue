@@ -1230,3 +1230,357 @@ describe("Atomic Enqueue-Time Idempotency", () => {
       expect(calculateSlot(hashedIdempotency)).toBe(targetSlot);
     });
   });
+
+describe("Native Dead-Letter Queue (DLQ) Management API", () => {
+  let queue;
+  let redis;
+
+  beforeAll(async () => {
+    redis = new Redis(redisUrl);
+  });
+
+  beforeEach(async () => {
+    await redis.flushall();
+
+    queue = new ResilientQueue({
+      redisUrl,
+      maxRetries: 1,
+      baseDelay: 100
+    });
+  });
+
+  afterEach(async () => {
+    if (queue) {
+      await queue.close();
+      queue = null;
+    }
+  });
+
+  afterAll(async () => {
+    await redis.quit();
+  });
+
+  test("getDLQCount returns exact count including 0 on empty DLQ", async () => {
+    expect(await queue.getDLQCount()).toBe(0);
+
+    await redis.rpush("rq:dlq", JSON.stringify({ id: "j1", data: 1 }));
+    await redis.rpush("rq:dlq", JSON.stringify({ id: "j2", data: 2 }));
+    expect(await queue.getDLQCount()).toBe(2);
+
+    await redis.rpush("rq:dlq", "corrupted-json");
+    expect(await queue.getDLQCount()).toBe(3);
+  });
+
+  test("getDLQ pagination with start, limit, and bounds", async () => {
+    for (let i = 0; i < 5; i++) {
+      await redis.rpush("rq:dlq", JSON.stringify({ id: `job-${i}`, data: { index: i } }));
+    }
+
+    const page1 = await queue.getDLQ({ start: 0, limit: 2 });
+    expect(page1.total).toBe(5);
+    expect(page1.jobs.length).toBe(2);
+    expect(page1.jobs[0].id).toBe("job-0");
+    expect(page1.jobs[1].id).toBe("job-1");
+
+    const page2 = await queue.getDLQ({ start: 2, limit: 2 });
+    expect(page2.total).toBe(5);
+    expect(page2.jobs.length).toBe(2);
+    expect(page2.jobs[0].id).toBe("job-2");
+    expect(page2.jobs[1].id).toBe("job-3");
+
+    const page3 = await queue.getDLQ({ start: 4, limit: 2 });
+    expect(page3.total).toBe(5);
+    expect(page3.jobs.length).toBe(1);
+    expect(page3.jobs[0].id).toBe("job-4");
+
+    const emptyPage = await queue.getDLQ({ start: 5, limit: 2 });
+    expect(emptyPage.total).toBe(5);
+    expect(emptyPage.jobs).toEqual([]);
+
+    const zeroLimit = await queue.getDLQ({ start: 0, limit: 0 });
+    expect(zeroLimit.total).toBe(5);
+    expect(zeroLimit.jobs).toEqual([]);
+  });
+
+  test("getDLQ supports ascending and descending order case-insensitively", async () => {
+    for (let i = 0; i < 4; i++) {
+      await redis.rpush("rq:dlq", JSON.stringify({ id: `job-${i}`, data: i }));
+    }
+
+    const asc = await queue.getDLQ({ start: 0, limit: 4, order: "asc" });
+    expect(asc.jobs.map(j => j.id)).toEqual(["job-0", "job-1", "job-2", "job-3"]);
+
+    const descUpper = await queue.getDLQ({ start: 0, limit: 4, order: "DESC" });
+    expect(descUpper.jobs.map(j => j.id)).toEqual(["job-3", "job-2", "job-1", "job-0"]);
+
+    const descPaged = await queue.getDLQ({ start: 1, limit: 2, order: "desc" });
+    expect(descPaged.jobs.map(j => j.id)).toEqual(["job-2", "job-1"]);
+  });
+
+  test("getDLQ safely handles corrupted JSON entries without crashing", async () => {
+    await redis.rpush("rq:dlq", JSON.stringify({ id: "valid-1", data: { ok: true } }));
+    await redis.rpush("rq:dlq", "{invalid-json-content-bad");
+    await redis.rpush("rq:dlq", "not-even-an-object");
+    await redis.rpush("rq:dlq", JSON.stringify({ id: "valid-2", data: { ok: true } }));
+
+    const res = await queue.getDLQ({ start: 0, limit: 10 });
+    expect(res.total).toBe(4);
+    expect(res.jobs.length).toBe(4);
+
+    expect(res.jobs[0].id).toBe("valid-1");
+    expect(res.jobs[0].corrupted).toBeUndefined();
+
+    expect(res.jobs[1].id).toBeNull();
+    expect(res.jobs[1].corrupted).toBe(true);
+    expect(res.jobs[1].raw).toBe("{invalid-json-content-bad");
+    expect(res.jobs[1].error).toBeDefined();
+
+    expect(res.jobs[2].id).toBeNull();
+    expect(res.jobs[2].corrupted).toBe(true);
+    expect(res.jobs[2].raw).toBe("not-even-an-object");
+
+    expect(res.jobs[3].id).toBe("valid-2");
+  });
+
+  test("getDLQ merges metadata from stalled_meta when available", async () => {
+    const rawJob = { id: "stalled-in-dlq", data: { test: 1 } };
+    await redis.rpush("rq:dlq", JSON.stringify(rawJob));
+    await redis.hset("rq:stalled_meta", "stalled-in-dlq", JSON.stringify({
+      stalledCount: 2,
+      lastStalledAt: 12345,
+      failedAt: 67890,
+      failureReason: "Stalled more than maxStalledCount"
+    }));
+
+    const res = await queue.getDLQ();
+    expect(res.jobs.length).toBe(1);
+    expect(res.jobs[0].id).toBe("stalled-in-dlq");
+    expect(res.jobs[0].stalledCount).toBe(2);
+    expect(res.jobs[0].lastStalledAt).toBe(12345);
+    expect(res.jobs[0].failedAt).toBe(67890);
+    expect(res.jobs[0].failureReason).toBe("Stalled more than maxStalledCount");
+  });
+
+  test("getDLQ validates arguments strictly", async () => {
+    await expect(queue.getDLQ({ start: -1 })).rejects.toThrow(/start must be a non-negative integer/);
+    await expect(queue.getDLQ({ start: 1.5 })).rejects.toThrow(/start must be a non-negative integer/);
+    await expect(queue.getDLQ({ limit: -5 })).rejects.toThrow(/limit must be a non-negative integer/);
+    await expect(queue.getDLQ({ limit: "invalid" })).rejects.toThrow(/limit must be a non-negative integer/);
+    await expect(queue.getDLQ({ order: "invalid" })).rejects.toThrow(/order must be "asc" or "desc"/);
+  });
+
+  test("retryDLQJob atomically moves one matching job to main queue and resets failure metadata", async () => {
+    const failedJob = {
+      id: "retry-target",
+      data: {
+        emptyArr: [],
+        largeNum: 9007199254740991,
+        nested: { innerArr: [] }
+      },
+      attempt: 3,
+      stalledCount: 2,
+      createdAt: 1000,
+      failedAt: 2000,
+      failureReason: "Network timeout",
+      lastError: "Connection refused",
+      retriedAt: 1500,
+      lastStalledAt: 1800,
+      lockToken: "token-abc"
+    };
+
+    await redis.rpush("rq:dlq", JSON.stringify(failedJob));
+    await redis.hset("rq:stalled_meta", "retry-target", JSON.stringify({ stalledCount: 2 }));
+
+    const retried = await queue.retryDLQJob("retry-target");
+    expect(retried).toBe(true);
+
+    // DLQ should be empty
+    expect(await queue.getDLQCount()).toBe(0);
+
+    // Stalled meta should be cleaned
+    expect(await redis.hget("rq:stalled_meta", "retry-target")).toBeNull();
+
+    // Main queue should have the job
+    const mainJobs = await redis.lrange("rq:main", 0, -1);
+    expect(mainJobs.length).toBe(1);
+    const requeuedJob = JSON.parse(mainJobs[0]);
+
+    expect(requeuedJob.id).toBe("retry-target");
+    expect(requeuedJob.attempt).toBe(0);
+    expect(requeuedJob.stalledCount).toBe(0);
+    expect(requeuedJob.failedAt).toBeUndefined();
+    expect(requeuedJob.failureReason).toBeUndefined();
+    expect(requeuedJob.lastError).toBeUndefined();
+    expect(requeuedJob.retriedAt).toBeUndefined();
+    expect(requeuedJob.lastStalledAt).toBeUndefined();
+    expect(requeuedJob.lockToken).toBeUndefined();
+    expect(requeuedJob.createdAt).toBe(1000);
+
+    // Verify preservation of empty arrays and large integers (no Lua cjson corruption)
+    expect(Array.isArray(requeuedJob.data.emptyArr)).toBe(true);
+    expect(requeuedJob.data.emptyArr.length).toBe(0);
+    expect(Array.isArray(requeuedJob.data.nested.innerArr)).toBe(true);
+    expect(requeuedJob.data.largeNum).toBe(9007199254740991);
+  });
+
+  test("retryDLQJob returns false for missing or non-existent job ID", async () => {
+    await redis.rpush("rq:dlq", JSON.stringify({ id: "existing-job", data: 1 }));
+
+    expect(await queue.retryDLQJob("non-existent")).toBe(false);
+    expect(await queue.retryDLQJob(null)).toBe(false);
+    expect(await queue.retryDLQJob(undefined)).toBe(false);
+    expect(await queue.retryDLQJob("")).toBe(false);
+
+    // DLQ was not modified
+    expect(await queue.getDLQCount()).toBe(1);
+  });
+
+  test("requeued job can be processed successfully by worker", async () => {
+    let processedJob = null;
+    queue.process(async (job) => {
+      processedJob = job;
+    });
+
+    const failedJob = {
+      id: "worker-reprocess-job",
+      data: { action: "send-email" },
+      attempt: 2,
+      stalledCount: 1,
+      createdAt: Date.now(),
+      failedAt: Date.now(),
+      failureReason: "Worker crashed"
+    };
+
+    await redis.rpush("rq:dlq", JSON.stringify(failedJob));
+    const retried = await queue.retryDLQJob("worker-reprocess-job");
+    expect(retried).toBe(true);
+
+    await waitForCondition(async () => processedJob !== null);
+    expect(processedJob.id).toBe("worker-reprocess-job");
+    expect(processedJob.data).toEqual({ action: "send-email" });
+    expect(processedJob.attempt).toBe(0);
+  });
+
+  test("retryAllDLQ requeues jobs in controlled batches, resets failure metadata, and cleans stalled_meta", async () => {
+    for (let i = 0; i < 5; i++) {
+      await redis.rpush("rq:dlq", JSON.stringify({
+        id: `batch-job-${i}`,
+        data: { num: i },
+        attempt: 2,
+        failedAt: Date.now(),
+        failureReason: "Some error"
+      }));
+      await redis.hset("rq:stalled_meta", `batch-job-${i}`, JSON.stringify({ stalledCount: 1 }));
+    }
+    // Also add a corrupted item in DLQ
+    await redis.rpush("rq:dlq", "corrupted-dlq-entry");
+
+    // Requeue batch of 2
+    const firstBatchCount = await queue.retryAllDLQ({ limit: 2 });
+    expect(firstBatchCount).toBe(2);
+    expect(await redis.llen("rq:main")).toBe(2);
+    expect(await queue.getDLQCount()).toBe(4); // 3 valid + 1 corrupted remaining
+
+    // Verify first 2 metadata cleaned
+    expect(await redis.hget("rq:stalled_meta", "batch-job-0")).toBeNull();
+    expect(await redis.hget("rq:stalled_meta", "batch-job-1")).toBeNull();
+    expect(await redis.hget("rq:stalled_meta", "batch-job-2")).not.toBeNull();
+
+    // Requeue remaining (limit omitted -> all eligible)
+    const secondBatchCount = await queue.retryAllDLQ();
+    expect(secondBatchCount).toBe(3); // 3 valid jobs requeued, corrupted skipped!
+    expect(await redis.llen("rq:main")).toBe(5);
+    expect(await queue.getDLQCount()).toBe(1); // corrupted entry remains in DLQ
+
+    const dlqItems = await redis.lrange("rq:dlq", 0, -1);
+    expect(dlqItems[0]).toBe("corrupted-dlq-entry");
+
+    // Check main queue jobs have reset metadata
+    const mainItems = await redis.lrange("rq:main", 0, -1);
+    for (const item of mainItems) {
+      const parsed = JSON.parse(item);
+      expect(parsed.attempt).toBe(0);
+      expect(parsed.stalledCount).toBe(0);
+      expect(parsed.failedAt).toBeUndefined();
+      expect(parsed.failureReason).toBeUndefined();
+    }
+  });
+
+  test("retryAllDLQ validates limit argument", async () => {
+    expect(await queue.retryAllDLQ({ limit: 0 })).toBe(0);
+    await expect(queue.retryAllDLQ({ limit: -1 })).rejects.toThrow(/limit must be a non-negative integer/);
+    await expect(queue.retryAllDLQ({ limit: 1.5 })).rejects.toThrow(/limit must be a non-negative integer/);
+  });
+
+  test("removeDLQJob removes a specific failed job and cleans associated metadata", async () => {
+    await redis.rpush("rq:dlq", JSON.stringify({ id: "job-remove-1", data: 1 }));
+    await redis.rpush("rq:dlq", JSON.stringify({ id: "job-remove-2", data: 2 }));
+    await redis.hset("rq:stalled_meta", "job-remove-1", JSON.stringify({ stalledCount: 1 }));
+    await redis.hset("rq:stalled_meta", "job-remove-2", JSON.stringify({ stalledCount: 1 }));
+
+    const removed = await queue.removeDLQJob("job-remove-1");
+    expect(removed).toBe(true);
+
+    expect(await queue.getDLQCount()).toBe(1);
+    expect(await redis.hget("rq:stalled_meta", "job-remove-1")).toBeNull();
+    expect(await redis.hget("rq:stalled_meta", "job-remove-2")).not.toBeNull();
+
+    const notFound = await queue.removeDLQJob("non-existent-id");
+    expect(notFound).toBe(false);
+
+    const emptyId = await queue.removeDLQJob("");
+    expect(emptyId).toBe(false);
+  });
+
+  test("purgeDLQ clears the DLQ, cleans associated metadata, and returns count purged", async () => {
+    expect(await queue.purgeDLQ()).toBe(0);
+
+    for (let i = 0; i < 3; i++) {
+      await redis.rpush("rq:dlq", JSON.stringify({ id: `purge-${i}`, data: i }));
+      await redis.hset("rq:stalled_meta", `purge-${i}`, JSON.stringify({ stalledCount: 1 }));
+    }
+    await redis.rpush("rq:dlq", "malformed-json-entry");
+
+    // Also set an active/delayed job metadata in stalled_meta which should NOT be touched
+    await redis.hset("rq:stalled_meta", "unrelated-active-job", JSON.stringify({ stalledCount: 1 }));
+
+    const count = await queue.purgeDLQ();
+    expect(count).toBe(4); // 3 valid + 1 malformed = 4
+    expect(await queue.getDLQCount()).toBe(0);
+
+    // DLQ jobs metadata cleaned
+    expect(await redis.hget("rq:stalled_meta", "purge-0")).toBeNull();
+    expect(await redis.hget("rq:stalled_meta", "purge-1")).toBeNull();
+    expect(await redis.hget("rq:stalled_meta", "purge-2")).toBeNull();
+
+    // Unrelated job metadata preserved
+    expect(await redis.hget("rq:stalled_meta", "unrelated-active-job")).not.toBeNull();
+  });
+
+  test("concurrent operations handle race conditions safely and atomically", async () => {
+    const job = { id: "concurrent-target", data: { test: "race" }, attempt: 2 };
+    await redis.rpush("rq:dlq", JSON.stringify(job));
+
+    // Two workers attempt to retry the same job concurrently
+    const [retry1, retry2] = await Promise.all([
+      queue.retryDLQJob("concurrent-target"),
+      queue.retryDLQJob("concurrent-target")
+    ]);
+
+    // Exactly one should succeed, the other should fail
+    expect([retry1, retry2].sort()).toEqual([false, true]);
+
+    // Only 1 job in main queue
+    expect(await redis.llen("rq:main")).toBe(1);
+    expect(await queue.getDLQCount()).toBe(0);
+
+    // Now test concurrent remove and retry
+    await redis.rpush("rq:dlq", JSON.stringify({ id: "race-job-2", data: 2 }));
+    const [remRes, retRes] = await Promise.all([
+      queue.removeDLQJob("race-job-2"),
+      queue.retryDLQJob("race-job-2")
+    ]);
+    expect([remRes, retRes].sort()).toEqual([false, true]);
+    expect(await queue.getDLQCount()).toBe(0);
+  });
+});
