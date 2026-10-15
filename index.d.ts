@@ -51,6 +51,21 @@ export interface Job<T = any> {
    * Unix timestamp (in milliseconds) when the job was most recently recovered from a stalled state.
    */
   lastStalledAt?: number;
+
+  /**
+   * Standard AbortSignal triggered if the job lease is lost (e.g. stalled or recovered by another worker).
+   */
+  signal?: AbortSignal;
+
+  /**
+   * Boolean flag indicating whether this worker's visibility lease for the job has expired or was revoked.
+   */
+  isLeaseLost?: boolean;
+
+  /**
+   * Per-dequeue fencing token identifying this specific execution lease.
+   */
+  lockToken?: string;
 }
 
 /**
@@ -127,6 +142,13 @@ export interface ProcessOptions {
 
 /**
  * Handler function invoked for each dequeued job.
+ *
+ * @remarks
+ * Handlers and downstream external operations must be designed to be idempotent
+ * or use an idempotency key. While per-dequeue fencing tokens prevent a stale worker
+ * from altering Redis locks or active queue state, lease expiration cannot forcibly
+ * interrupt external side-effects already in progress. Handlers can inspect `job.signal`
+ * or pass it to abort-aware APIs (such as `fetch`) to be notified immediately upon lease loss.
  */
 export type JobHandler<T = any> = (job: Job<T>) => Promise<void> | void;
 

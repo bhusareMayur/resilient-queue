@@ -209,7 +209,11 @@ class ResilientQueue {
       try {
         await handler(job);
       } catch (error) {
-        await this.retryManager.handleFailure(job, error);
+        // If the lease was lost while handler was running, the recovery scheduler
+        // already re-queued or dead-lettered this job. Do not duplicate failure handling.
+        if (!job.isLeaseLost) {
+          await this.retryManager.handleFailure(job, error);
+        }
       }
     };
 
@@ -243,9 +247,41 @@ class ResilientQueue {
             continue;
           }
 
-          // Acquire lock and start heartbeat for this in-flight job
-          await this.stalledJobManager.acquireLock(job.id);
-          this.stalledJobManager.startHeartbeat(job.id);
+          // Attach recovery metadata stored outside the raw payload
+          const meta = await this.stalledJobManager.getStalledMetadata(job.id);
+          if (meta) {
+            job.stalledCount = meta.stalledCount;
+            job.lastStalledAt = meta.lastStalledAt;
+            if (meta.attempt !== undefined) {
+              job.attempt = meta.attempt;
+            }
+          } else {
+            job.stalledCount = job.stalledCount || 0;
+          }
+
+          // Generate per-dequeue fencing token
+          const lockToken = uuidv4();
+          job.lockToken = lockToken;
+
+          // Surface lease loss to the handler using AbortController and flags
+          const abortController = new AbortController();
+          job.signal = abortController.signal;
+          job.isLeaseLost = false;
+
+          // Acquire lock with fencing token
+          await this.stalledJobManager.acquireLock(job.id, lockToken);
+
+          // Start heartbeat with fencing token and lease loss callback
+          this.stalledJobManager.startHeartbeat(job.id, lockToken, () => {
+            job.isLeaseLost = true;
+            if (!abortController.signal.aborted) {
+              abortController.abort(
+                new Error(
+                  "Job lease lost: lock expired or was recovered as stalled by another worker"
+                )
+              );
+            }
+          });
 
           // Dispatch job to the in-memory pool
           let jobPromise;
@@ -258,7 +294,7 @@ class ResilientQueue {
               }
             } finally {
               try {
-                await this.stalledJobManager.releaseLock(rawJob, job.id);
+                await this.stalledJobManager.releaseLock(rawJob, job.id, lockToken);
               } catch (cleanupError) {
                 if (this.isRunning) {
                   console.error("Failed to release stalled job lock:", cleanupError);
@@ -340,6 +376,13 @@ class ResilientQueue {
     } finally {
       await this.redisClientWrapper.disconnect();
     }
+  }
+
+  /**
+   * Get recovery or failure metadata stored for a job.
+   */
+  async getJobMetadata(jobId) {
+    return await this.stalledJobManager.getStalledMetadata(jobId);
   }
 
 }

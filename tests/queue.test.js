@@ -10,6 +10,21 @@ const redisUrl = "redis://127.0.0.1:6379";
 
 jest.setTimeout(20000);
 
+async function waitForCondition(conditionFn, timeoutMs = 4000, intervalMs = 25) {
+  const startTime = Date.now();
+  while (Date.now() - startTime < timeoutMs) {
+    try {
+      if (await conditionFn()) {
+        return;
+      }
+    } catch {
+      // ignore and retry
+    }
+    await new Promise((resolve) => setTimeout(resolve, intervalMs));
+  }
+  throw new Error(`waitForCondition timed out after ${timeoutMs}ms`);
+}
+
 describe("ResilientQueue Core Behavior", () => {
   let queue;
   let redis;
@@ -299,7 +314,7 @@ await queue.close();
 
     await new Promise((r) => setTimeout(r, 100));
     await queue.enqueue({ test: "in-flight-tracking" });
-    await new Promise((r) => setTimeout(r, 400));
+    await waitForCondition(async () => checkedInFlight && (await redis.llen("rq:active")) === 0);
 
     expect(checkedInFlight).toBe(true);
     expect(inFlightActiveCount).toBe(1);
@@ -338,7 +353,7 @@ await queue.close();
       processedJob = job;
     });
 
-    await new Promise((r) => setTimeout(r, 600));
+    await waitForCondition(async () => processedJob !== null && (await redis.llen("rq:active")) === 0);
 
     expect(processedJob).not.toBeNull();
     expect(processedJob.id).toBe("crashed-job-1");
@@ -379,7 +394,7 @@ await queue.close();
       processed = true;
     });
 
-    await new Promise((r) => setTimeout(r, 600));
+    await waitForCondition(async () => processed && (await redis.llen("rq:active")) === 0);
 
     expect(processed).toBe(true);
     expect(await redis.llen("rq:active")).toBe(0);
@@ -412,15 +427,16 @@ await queue.close();
 
     queue.process(async () => {});
 
-    await new Promise((r) => setTimeout(r, 600));
+    await waitForCondition(async () => (await redis.llen("rq:dlq")) === 1 && (await redis.llen("rq:active")) === 0);
 
     const dlqItems = await redis.lrange("rq:dlq", 0, -1);
     expect(dlqItems.length).toBe(1);
 
     const dlqJob = JSON.parse(dlqItems[0]);
     expect(dlqJob.id).toBe("poison-job-1");
-    expect(dlqJob.stalledCount).toBe(2);
-    expect(dlqJob.failureReason).toContain("Job stalled more than maxStalledCount times");
+    const meta = await queue.getJobMetadata(dlqJob.id);
+    expect(meta.stalledCount).toBe(2);
+    expect(meta.failureReason).toContain("Job stalled more than maxStalledCount times");
     expect(await redis.llen("rq:active")).toBe(0);
     expect(await redis.zcard("rq:locks")).toBe(0);
   });
@@ -445,11 +461,128 @@ await queue.close();
     await new Promise((r) => setTimeout(r, 50));
     await queue.enqueue({ test: "long-runner" });
 
-    await new Promise((r) => setTimeout(r, 1200));
+    await waitForCondition(async () => executionCount === 1 && (await redis.llen("rq:active")) === 0, 4000);
 
     expect(executionCount).toBe(1);
     expect(await redis.llen("rq:active")).toBe(0);
     expect(await redis.zcard("rq:locks")).toBe(0);
+  });
+
+  test("fencing token rejects stale release when lease was superseded by another worker", async () => {
+    const jobId = "fenced-job-1";
+    const tokenA = "token-A";
+    const tokenB = "token-B";
+    const rawJob = JSON.stringify({ id: jobId, data: { test: "fencing" } });
+
+    // Worker A acquires lock with tokenA
+    await queue.stalledJobManager.acquireLock(jobId, tokenA);
+    await redis.rpush("rq:active", rawJob);
+
+    // Simulate Worker B taking over with tokenB
+    await queue.stalledJobManager.acquireLock(jobId, tokenB);
+
+    // Stale Worker A attempts to release lock with tokenA
+    const staleReleaseResult = await queue.stalledJobManager.releaseLock(rawJob, jobId, tokenA);
+    expect(staleReleaseResult).toBe(0);
+
+    // Active queue and Worker B's token must remain untouched
+    expect(await redis.llen("rq:active")).toBe(1);
+    expect(await redis.hget("rq:lock_tokens", jobId)).toBe(tokenB);
+
+    // Worker B releases with valid tokenB
+    const validReleaseResult = await queue.stalledJobManager.releaseLock(rawJob, jobId, tokenB);
+    expect(validReleaseResult).toBe(1);
+    expect(await redis.llen("rq:active")).toBe(0);
+    expect(await redis.hget("rq:lock_tokens", jobId)).toBeNull();
+  });
+
+  test("surfaces lease loss to running handler via job.signal and job.isLeaseLost", async () => {
+    await queue.close();
+
+    queue = new ResilientQueue({
+      redisUrl,
+      maxRetries: 1,
+      baseDelay: 100,
+      lockDuration: 200,
+      stalledInterval: 100
+    });
+
+    let leaseLostObserved = false;
+    let signalAbortedObserved = false;
+
+    queue.process(async (job) => {
+      // Simulate that the token in Redis is superseded externally by another worker / recovery
+      await new Promise((r) => setTimeout(r, 50));
+      // Invalidate Worker's token in Redis
+      await redis.hset("rq:lock_tokens", job.id, "different-token");
+
+      // Wait for heartbeat tick to detect lease loss
+      await new Promise((resolve) => {
+        const check = setInterval(() => {
+          if (job.isLeaseLost && job.signal.aborted) {
+            leaseLostObserved = job.isLeaseLost;
+            signalAbortedObserved = job.signal.aborted;
+            clearInterval(check);
+            resolve();
+          }
+        }, 20);
+      });
+    });
+
+    await new Promise((r) => setTimeout(r, 50));
+    await queue.enqueue({ test: "lease-loss-signal" });
+
+    await waitForCondition(async () => leaseLostObserved && signalAbortedObserved, 3000);
+
+    expect(leaseLostObserved).toBe(true);
+    expect(signalAbortedObserved).toBe(true);
+  });
+
+  test("preserves raw job data structures without Lua cjson serialization corruption during recovery", async () => {
+    await queue.close();
+
+    queue = new ResilientQueue({
+      redisUrl,
+      maxRetries: 2,
+      baseDelay: 100,
+      lockDuration: 400,
+      stalledInterval: 100
+    });
+
+    const originalData = {
+      emptyTags: [],
+      emptyList: [],
+      largePrecisionId: 9007199254740991,
+      nested: { emptyChild: [] }
+    };
+
+    const crashedJob = {
+      id: "raw-preserve-job",
+      data: originalData,
+      attempt: 0,
+      stalledCount: 0,
+      idempotencyKey: null,
+      ttlSeconds: null,
+      createdAt: Date.now()
+    };
+
+    const rawJobString = JSON.stringify(crashedJob);
+    await redis.rpush("rq:active", rawJobString);
+    await redis.zadd("rq:locks", Date.now() - 500, crashedJob.id);
+
+    let recoveredJobData = null;
+    queue.process(async (job) => {
+      recoveredJobData = job.data;
+    });
+
+    await waitForCondition(async () => recoveredJobData !== null && (await redis.llen("rq:active")) === 0);
+
+    // Verify empty arrays were NOT converted to objects by Lua cjson.decode/encode
+    expect(Array.isArray(recoveredJobData.emptyTags)).toBe(true);
+    expect(recoveredJobData.emptyTags.length).toBe(0);
+    expect(Array.isArray(recoveredJobData.emptyList)).toBe(true);
+    expect(Array.isArray(recoveredJobData.nested.emptyChild)).toBe(true);
+    expect(recoveredJobData.largePrecisionId).toBe(9007199254740991);
   });
 });
 

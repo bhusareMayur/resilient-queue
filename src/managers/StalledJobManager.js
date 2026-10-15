@@ -1,5 +1,5 @@
 /**
- * Handles crash durability and recovery of in-flight stalled jobs.
+ * Handles crash durability, recovery of in-flight stalled jobs, and fencing tokens.
  */
 class StalledJobManager {
   constructor(producer, options = {}) {
@@ -12,6 +12,8 @@ class StalledJobManager {
     this.mainQueueKey = `${this.keyPrefix}:main`;
     this.activeQueueKey = `${this.keyPrefix}:active`;
     this.locksKey = `${this.keyPrefix}:locks`;
+    this.tokensKey = `${this.keyPrefix}:lock_tokens`;
+    this.stalledMetaKey = `${this.keyPrefix}:stalled_meta`;
     this.dlqKey = `${this.keyPrefix}:dlq`;
 
     this.lockDuration = options.lockDuration ?? 30000;
@@ -60,25 +62,73 @@ class StalledJobManager {
   }
 
   /**
-   * Acquire a visibility lock for the in-flight job.
+   * Acquire a visibility lock with a per-dequeue fencing token for the in-flight job.
    */
-  async acquireLock(jobId) {
+  async acquireLock(jobId, lockToken = null) {
     if (!jobId) return;
     const expiry = Date.now() + this.lockDuration;
-    await this.producer.zadd(this.locksKey, expiry, jobId);
+    const pipeline = this.producer.pipeline();
+    if (lockToken) {
+      pipeline.hset(this.tokensKey, jobId, lockToken);
+    }
+    pipeline.zadd(this.locksKey, expiry, jobId);
+    await pipeline.exec();
+  }
+
+  /**
+   * Renew the visibility lock using the fencing token.
+   * If the token does not match (lease was lost or recovered), renewal fails.
+   */
+  async renewLock(jobId, lockToken) {
+    if (!jobId || !lockToken) return false;
+
+    const script = `
+      local currentToken = redis.call('HGET', KEYS[1], ARGV[1])
+      if currentToken == ARGV[2] then
+        redis.call('ZADD', KEYS[2], ARGV[3], ARGV[1])
+        return 1
+      else
+        return 0
+      end
+    `;
+
+    const newExpiry = Date.now() + this.lockDuration;
+    const result = await this.producer.eval(
+      script,
+      2,
+      this.tokensKey,
+      this.locksKey,
+      jobId,
+      lockToken,
+      newExpiry
+    );
+
+    return result === 1;
   }
 
   /**
    * Start a recurring heartbeat to extend the visibility lock while the job is active.
+   * Calls onLeaseLost callback if the lock token is no longer valid.
    */
-  startHeartbeat(jobId) {
+  startHeartbeat(jobId, lockToken = null, onLeaseLost = null) {
     if (!jobId) return;
     this.stopHeartbeat(jobId);
 
     const timer = setInterval(async () => {
       try {
-        const expiry = Date.now() + this.lockDuration;
-        await this.producer.zadd(this.locksKey, expiry, jobId);
+        if (lockToken) {
+          const renewed = await this.renewLock(jobId, lockToken);
+          if (!renewed) {
+            // Lease lost! Another worker or recovery scheduler has taken over.
+            this.stopHeartbeat(jobId);
+            if (typeof onLeaseLost === "function") {
+              onLeaseLost();
+            }
+          }
+        } else {
+          const expiry = Date.now() + this.lockDuration;
+          await this.producer.zadd(this.locksKey, expiry, jobId);
+        }
       } catch (err) {
         // Library should not crash on heartbeat network blips
       }
@@ -115,20 +165,55 @@ class StalledJobManager {
 
   /**
    * Release lock and remove job from active queue upon completion or failure.
+   * Fenced by lockToken to ensure stale workers cannot release successor workers' locks.
    */
-  async releaseLock(rawJob, jobId) {
+  async releaseLock(rawJob, jobId, lockToken = null) {
     if (jobId) {
       this.stopHeartbeat(jobId);
     }
 
-    const pipeline = this.producer.pipeline();
-    if (rawJob) {
-      pipeline.lrem(this.activeQueueKey, 1, rawJob);
+    if (!jobId || !lockToken) {
+      // Fallback if no token was passed
+      const pipeline = this.producer.pipeline();
+      if (rawJob) {
+        pipeline.lrem(this.activeQueueKey, 1, rawJob);
+      }
+      if (jobId) {
+        pipeline.zrem(this.locksKey, jobId);
+        pipeline.hdel(this.tokensKey, jobId);
+        pipeline.hdel(this.stalledMetaKey, jobId);
+      }
+      await pipeline.exec();
+      return;
     }
-    if (jobId) {
-      pipeline.zrem(this.locksKey, jobId);
-    }
-    await pipeline.exec();
+
+    const script = `
+      local currentToken = redis.call('HGET', KEYS[1], ARGV[1])
+      if currentToken == ARGV[2] then
+        redis.call('HDEL', KEYS[1], ARGV[1])
+        redis.call('ZREM', KEYS[2], ARGV[1])
+        redis.call('HDEL', KEYS[4], ARGV[1])
+        if ARGV[3] and #ARGV[3] > 0 then
+          redis.call('LREM', KEYS[3], 1, ARGV[3])
+        end
+        return 1
+      else
+        -- Fenced: lock token mismatch or lease already lost
+        return 0
+      end
+    `;
+
+    return this.producer.eval(
+      script,
+      4,
+      this.tokensKey,
+      this.locksKey,
+      this.activeQueueKey,
+      this.stalledMetaKey,
+      jobId,
+      lockToken,
+      rawJob || ""
+    );
   }
 
   /**
@@ -140,8 +225,23 @@ class StalledJobManager {
   }
 
   /**
+   * Get stalled metadata stored separately from the raw job payload.
+   */
+  async getStalledMetadata(jobId) {
+    if (!jobId) return null;
+    const raw = await this.producer.hget(this.stalledMetaKey, jobId);
+    if (!raw) return null;
+    try {
+      return JSON.parse(raw);
+    } catch {
+      return null;
+    }
+  }
+
+  /**
    * Recover stalled jobs whose locks have expired or active jobs that were orphaned.
-   * Atomically re-queues them back to rq:main or moves to DLQ if maxStalledCount/maxRetries is exceeded.
+   * Atomically moves the UNTOUCHED raw job string (preventing Lua JSON serialization corruption)
+   * while tracking stalled recovery metadata outside the job payload.
    */
   async recoverStalledJobs() {
     const script = `
@@ -161,31 +261,53 @@ class StalledJobManager {
           if ok and obj and obj.id == id then
             redis.call('LREM', KEYS[2], 1, j)
             redis.call('ZREM', KEYS[1], id)
+            redis.call('HDEL', KEYS[5], id)
             recoveredSet[id] = true
 
-            local count = (obj.stalledCount or 0) + 1
-            obj.stalledCount = count
-            obj.lastStalledAt = now
+            -- Retrieve any prior stalled count tracked in separate metadata Hash
+            local currentMetaRaw = redis.call('HGET', KEYS[6], id)
+            local currentCount = 0
+            if currentMetaRaw then
+              local okMeta, metaObj = pcall(cjson.decode, currentMetaRaw)
+              if okMeta and metaObj and metaObj.stalledCount then
+                currentCount = tonumber(metaObj.stalledCount)
+              end
+            elseif obj.stalledCount then
+              currentCount = tonumber(obj.stalledCount)
+            end
 
+            local count = currentCount + 1
             local nextAttempt = (obj.attempt or 0) + 1
-            obj.attempt = nextAttempt
+
+            local metaData = {
+              stalledCount = count,
+              lastStalledAt = now,
+              attempt = nextAttempt
+            }
 
             if count > maxStalledCount or nextAttempt > maxRetries then
-              obj.failedAt = now
+              metaData.failedAt = now
               if count > maxStalledCount then
-                obj.failureReason = 'Job stalled more than maxStalledCount times (' .. tostring(maxStalledCount) .. ')'
+                metaData.failureReason = 'Job stalled more than maxStalledCount times (' .. tostring(maxStalledCount) .. ')'
               else
-                obj.failureReason = 'Job stalled and exceeded maxRetries (' .. tostring(maxRetries) .. ')'
+                metaData.failureReason = 'Job stalled and exceeded maxRetries (' .. tostring(maxRetries) .. ')'
               end
-              redis.call('RPUSH', KEYS[4], cjson.encode(obj))
+              -- Move the pristine raw string j directly to DLQ without re-encoding
+              redis.call('RPUSH', KEYS[4], j)
             else
-              redis.call('RPUSH', KEYS[3], cjson.encode(obj))
+              -- Move the pristine raw string j directly to main queue without re-encoding
+              redis.call('RPUSH', KEYS[3], j)
             end
+
+            -- Persist recovery metadata outside the raw job data
+            redis.call('HSET', KEYS[6], id, cjson.encode(metaData))
+
             rec = rec + 1
             break
           end
         end
         redis.call('ZREM', KEYS[1], id)
+        redis.call('HDEL', KEYS[5], id)
       end
 
       -- Ensure any active job without a lock gets a provisional lock so it cannot be orphaned
@@ -204,11 +326,13 @@ class StalledJobManager {
 
     return this.producer.eval(
       script,
-      4,
+      6,
       this.locksKey,
       this.activeQueueKey,
       this.mainQueueKey,
       this.dlqKey,
+      this.tokensKey,
+      this.stalledMetaKey,
       Date.now(),
       this.maxStalledCount,
       this.lockDuration,

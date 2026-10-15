@@ -7,7 +7,7 @@
 [![license](https://img.shields.io/npm/l/@mayurbhusare/resilient-queue?style=flat-square&color=blue)](./LICENSE)
 [![downloads](https://img.shields.io/npm/dt/@mayurbhusare/resilient-queue?style=flat-square&color=green)](https://www.npmjs.com/package/@mayurbhusare/resilient-queue)
 [![node](https://img.shields.io/node/v/@mayurbhusare/resilient-queue?style=flat-square)](https://nodejs.org)
-[![tests](https://img.shields.io/badge/tests-13%20passed-brightgreen?style=flat-square&logo=jest)](https://github.com/bhusareMayur/resilient-queue)
+[![tests](https://img.shields.io/badge/tests-16%20passed-brightgreen?style=flat-square&logo=jest)](https://github.com/bhusareMayur/resilient-queue)
 [![redis](https://img.shields.io/badge/redis-backed-red?style=flat-square&logo=redis)](https://redis.io)
 
 A lightweight, production-grade, Redis-backed job queue for Node.js.
@@ -247,9 +247,14 @@ In standard Redis queues using `BLPOP`, if a worker process crashes (OOM killer,
 `@mayurbhusare/resilient-queue` solves this with the **Reliable Queue Pattern + Active Visibility Heartbeat**:
 
 1. **Atomic Dequeue**: Jobs are moved atomically from `rq:main` to `rq:active` using `BLMOVE` (or `BRPOPLPUSH`). The job is **never removed from Redis during execution**.
-2. **Visibility Lock & Heartbeat**: The worker registers a lock in `rq:locks` (`Date.now() + lockDuration`). A non-blocking background heartbeat continually renews this lock as long as the worker is alive.
-3. **Automatic Recovery**: If the worker process dies or hangs, the heartbeat ceases. An internal recovery scheduler runs an atomic Lua script that finds expired locks, re-queues abandoned jobs back into `rq:main`, and ensures no duplicate is lost.
-4. **Poison Pill Protection**: If a malformed payload repeatedly crashes worker processes, the queue tracks `stalledCount`. If `stalledCount > maxStalledCount` (default: `1`), the job is safely diverted straight to `rq:dlq` with a diagnostic failure reason, preventing infinite crash loops!
+2. **Per-Dequeue Fencing Token**: Each worker execution generates a unique `lockToken` recorded in `rq:lock_tokens`. Stale workers that experienced network delays or GC pauses are **fenced**: their heartbeats and release calls cannot overwrite or delete a successor worker's lock or active queue entry!
+3. **Visibility Lock & Heartbeat**: The worker registers a lock in `rq:locks` (`Date.now() + lockDuration`). A non-blocking background heartbeat continually renews this lock as long as the worker holds the valid lease.
+4. **Surfacing Lease Loss via AbortSignal**: If a worker loses its lease (e.g. heartbeat timeout or recovery takeover), `job.isLeaseLost` is set to `true` and `job.signal` (standard `AbortSignal`) is automatically aborted. Handlers can pass `job.signal` to abort-aware APIs (like `fetch` or database clients) to cancel running operations immediately.
+5. **Automatic Recovery**: If the worker process dies or hangs, the heartbeat ceases. An internal recovery scheduler runs an atomic Lua script that revokes the expired token, re-queues abandoned jobs back into `rq:main`, and ensures no job is lost.
+6. **Poison Pill Protection**: If a malformed payload repeatedly crashes worker processes, the queue tracks `stalledCount`. If `stalledCount > maxStalledCount` (default: `1`), the job is safely diverted straight to `rq:dlq` with a diagnostic failure reason, preventing infinite crash loops!
+
+> [!WARNING]
+> **Idempotent Handlers Required**: While per-dequeue fencing tokens prevent a stale worker from corrupting Redis locks or active queue state, lease fencing **cannot forcibly terminate** arbitrary in-flight asynchronous code or external API calls already in flight. Your job handlers and downstream operations **must be designed to be idempotent** (or use an `idempotencyKey`) and should check `job.signal.aborted` or `job.signal.throwIfAborted()` where appropriate.
 
 ---
 
