@@ -7,7 +7,7 @@
 [![license](https://img.shields.io/npm/l/@mayurbhusare/resilient-queue?style=flat-square&color=blue)](./LICENSE)
 [![downloads](https://img.shields.io/npm/dt/@mayurbhusare/resilient-queue?style=flat-square&color=green)](https://www.npmjs.com/package/@mayurbhusare/resilient-queue)
 [![node](https://img.shields.io/node/v/@mayurbhusare/resilient-queue?style=flat-square)](https://nodejs.org)
-[![tests](https://img.shields.io/badge/tests-16%20passed-brightgreen?style=flat-square&logo=jest)](https://github.com/bhusareMayur/resilient-queue)
+[![tests](https://img.shields.io/badge/tests-30%20passed-brightgreen?style=flat-square&logo=jest)](https://github.com/bhusareMayur/resilient-queue)
 [![redis](https://img.shields.io/badge/redis-backed-red?style=flat-square&logo=redis)](https://redis.io)
 
 A lightweight, production-grade, Redis-backed job queue for Node.js.
@@ -59,11 +59,14 @@ Built for resilience, **`@mayurbhusare/resilient-queue`** provides **crash-proof
 
 ```mermaid
 flowchart TD
-    A[Producer: queue.enqueue] -->|RPUSH| B[Main Queue: rq:main]
+    A[Producer: queue.enqueue] -->|Atomic Lua Check| IDEM{Key exists in Redis?}
+    IDEM -- "Yes (Duplicate)" --> RET[Return Existing Job ID\nNo Queue Push]
+    IDEM -- "No" --> SET_KEY[Register Job ID in rq:idempotency\nRPUSH to rq:main]
+    SET_KEY --> B[Main Queue: rq:main]
     B -->|Atomic BLMOVE 1s| C[Active Queue: rq:active]
     C -->|Acquire Visibility Lock| L[Locks ZSET: rq:locks]
-    C -->|Check Idempotency| D{Attempt == 0 & Key exists?}
-    D -- "Duplicate (SET NX fails)" --> X[Discard & Clean Lock]
+    C -->|Defense-in-Depth Idempotency| D{Attempt == 0 & Id matches?}
+    D -- "Mismatch (Duplicate)" --> X[Discard & Clean Lock]
     D -- "Proceed" --> E[Execute Handler & Heartbeat Lock]
     
     E -->|Success| S[Job Completed & Clean Lock]
@@ -84,11 +87,11 @@ flowchart TD
 ```
 
 ### Lifecycle Highlights:
-1. **Enqueuing**: Jobs receive a unique UUID and are pushed to the Redis list `rq:main`.
+1. **Atomic Enqueuing & Idempotency**: Jobs receive a candidate UUID. If an `idempotencyKey` is supplied, an atomic Redis Lua script checks whether the key is already registered. If it exists, the existing job ID is returned immediately without creating a duplicate queue entry. If not, the candidate job ID is registered (with optional TTL) and pushed to `rq:main` in a single atomic Redis operation.
 2. **Atomic Dequeuing**: Workers fetch jobs using Redis `BLMOVE` (Redis 6.2+) or `BRPOPLPUSH` into `rq:active`. Jobs are **never deleted from Redis during execution**.
 3. **Visibility Lock & Heartbeat**: When picked up, a lock is registered in `rq:locks` with an expiration timestamp (`Date.now() + lockDuration`). A lightweight background heartbeat continually renews the lock while the job is executing.
 4. **Stalled Job Recovery**: If a worker crashes or is killed (`SIGKILL`, OOM, reboot), its heartbeat stops. The queue's recovery scheduler inspects `rq:locks`, automatically re-queues abandoned jobs back into `rq:main`, or routes poison pills to `rq:dlq` if `maxStalledCount` is exceeded.
-5. **Idempotency Check**: On `attempt === 0` (and `stalledCount === 0`), if an `idempotencyKey` is provided, Redis `SET NX` locks it. If it was already processed, the duplicate is skipped. Retries and recovered jobs bypass this check.
+5. **Idempotency Defense-in-Depth**: On initial execution (`attempt === 0` and `stalledCount === 0`), workers verify that the active job ID matches the registered idempotency key before running the handler. Retries and recovered jobs bypass this check.
 6. **Execution & Finalization**: Upon completion or failure, the job is atomically removed from `rq:active` and its visibility lock is released.
 7. **Crash-Durable Retries**: If the handler throws a `RetryableError` and attempts remain, the job is persisted to `rq:delayed` (a Redis ZSET) and promoted back via atomic Lua script.
 8. **Dead Lettering**: If a job exhausts all retries, throws a `FatalError`, or repeatedly crashes workers beyond `maxStalledCount`, it is routed immediately to `rq:dlq`.
@@ -355,7 +358,7 @@ async function checkDeadLetterQueue() {
 To guarantee **at-most-once** delivery across distributed producers and retries:
 
 ```javascript
-await queue.enqueue(
+const jobId = await queue.enqueue(
   { invoiceId: "INV-2026-001" },
   {
     idempotencyKey: "invoice:INV-2026-001",
@@ -365,9 +368,15 @@ await queue.enqueue(
 ```
 
 #### How it works:
-1. When a job is dequeued for the first time (`job.attempt === 0`), the worker executes a Redis `SET <keyPrefix>:idempotency:<key> 1 NX [EX ttl]`.
-2. If another job with the same key has already been processed or is currently stored, Redis returns `null`, and the duplicate is safely discarded without executing the handler.
-3. **Retries Are Never Blocked**: Once a job has started processing, any subsequent retry attempts (`job.attempt > 0`) bypass the idempotency check, ensuring retries continue to completion without deadlocking.
+1. **Atomic Enqueue-Time Deduplication**: When `queue.enqueue()` receives an `idempotencyKey`, it executes an atomic Redis Lua script.
+   - If the key is **already registered**, Redis returns the existing job ID immediately. No duplicate job is pushed to the queue, avoiding queue pollution, wasted memory, and redundant worker consumption.
+   - If the key is **new**, Redis registers the key mapped to the candidate job ID (with optional TTL expiration) and atomically pushes the job payload to `rq:main`.
+2. **Deterministic Return Contract**: Concurrent or repeated calls to `queue.enqueue()` with the same `idempotencyKey` always return the exact same original job ID while the idempotency key remains active.
+3. **TTL Expiration (`ttlSeconds`)**:
+   - Supplying a positive integer (e.g. `ttlSeconds: 86400`) configures the idempotency key to expire in Redis after that duration. Once expired, a new job with the same key can be enqueued.
+   - When omitted, `0`, or non-positive, the idempotency key persists indefinitely in Redis.
+4. **Defense-in-Depth Dequeue Verification**: When workers execute a job for the first time (`attempt === 0`), they verify the job ID matches the registered key. If an unexpected duplicate enters the queue (e.g. legacy producers), it is safely discarded.
+5. **Retries & Stalled Recovery Are Never Blocked**: Once a job is processing, subsequent retries (`job.attempt > 0`) or recovered crashed jobs (`job.stalledCount > 0`) bypass idempotency checks, ensuring execution runs to completion.
 
 ---
 
@@ -454,9 +463,9 @@ Pushes a new job to the tail of the main queue.
 - **Parameters**:
   - `data` (`any`): Any JSON-serializable value representing the job payload.
   - `options` (`object`, optional):
-    - `idempotencyKey` (`string`, optional): Unique key for deduplication.
-    - `ttlSeconds` (`number`, optional): Time-to-live in seconds for the idempotency key in Redis.
-- **Returns**: `Promise<string>` — The auto-generated UUID v4 string of the job.
+    - `idempotencyKey` (`string`, optional): Unique key for deduplication. Duplicate calls return the existing job ID without inserting another job.
+    - `ttlSeconds` (`number`, optional): Time-to-live in seconds for the idempotency key in Redis. A positive integer sets key expiration; `0`, non-positive, or omitted persists indefinitely.
+- **Returns**: `Promise<string>` — The auto-generated UUID v4 string of the job (or the existing job ID if `idempotencyKey` was already registered).
 
 ---
 
@@ -519,7 +528,7 @@ All keys are namespaced by the configured `keyPrefix` (default: `rq`):
 | `<keyPrefix>:locks` | `Sorted Set` | Active job visibility locks periodically extended by worker heartbeats. |
 | `<keyPrefix>:delayed` | `Sorted Set` | Scheduled retries waiting for their delay window to elapse. Score is the Unix timestamp (ms). |
 | `<keyPrefix>:dlq` | `List` | Dead Letter Queue holding exhausted, fatal, or poison pill failed jobs with diagnostic metadata. |
-| `<keyPrefix>:idempotency:<key>` | `String` | Idempotency lock stored via `SET NX` with optional TTL expiration (`EX`). |
+| `<keyPrefix>:idempotency:<key>` | `String` | Idempotency key mapping to registered job ID via atomic Lua script with optional TTL expiration (`EX`). |
 
 ---
 

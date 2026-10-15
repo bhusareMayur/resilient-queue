@@ -168,7 +168,7 @@ export class ResilientQueue {
    *
    * @param data Any JSON-serializable job payload.
    * @param options Optional enqueue settings (idempotency key and TTL).
-   * @returns Resolves to the unique UUID v4 generated for the job.
+   * @returns Resolves to the unique UUID v4 generated for the job, or existing job ID if idempotencyKey was already registered.
    */
   enqueue<T = any>(data: T, options?: EnqueueOptions): Promise<string>;
 
