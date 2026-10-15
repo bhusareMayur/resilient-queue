@@ -1,63 +1,138 @@
 # Contributing to Resilient Queue
 
-Thank you for considering contributing to Resilient Queue 🚀
-
-We welcome contributions of all kinds - bug fixes, improvements, documentation updates, and feature proposals.
+Thank you for your interest in contributing to `@mayurbhusare/resilient-queue`. We welcome bug fixes, documentation improvements, test coverage enhancements, and feature proposals.
 
 ---
 
-## 📌 How to Contribute
+## Maintenance Mode Note
 
-### 1. Fork the repository
-Click "Fork" and clone your copy locally.
+This project is in maintenance mode. We actively review and merge pull requests that address bugs, reliability issues, security concerns, and documentation accuracy. Large feature proposals or architectural overhauls should be discussed in an issue before submitting code.
+
+---
+
+## Development Prerequisites
+
+- **Node.js**: Node.js 18 or later.
+- **Redis Server**: A running Redis instance at `127.0.0.1:6379` (Redis 6.2+ recommended; Redis 5.0+ supported).
+- **Git**: Git 2.20 or later.
+
+---
+
+## Getting Started
+
+### 1. Fork and Clone
+
+Fork the repository on GitHub, then clone your local fork:
 
 ```bash
 git clone https://github.com/bhusareMayur/resilient-queue.git
+cd resilient-queue
 ```
-### 2. Create a new branch
-```bash
-git checkout -b feature/your-feature-name
-```
-### 3. Make your changes
- - Keep changes focused and minimal.
- - Follow existing code style.
- - Write clean and readable code.
 
-### 4. Add or update tests (if applicable)
-We use Jest for testing:
+### 2. Install Dependencies
+
+Install development dependencies:
+
+```bash
+npm install
+```
+
+### 3. Create a Feature Branch
+
+Create a branch with a descriptive name:
+
+```bash
+# For a bug fix
+git checkout -b fix/heartbeat-lock-renewal
+
+# For documentation
+git checkout -b docs/clarify-cluster-hash-tags
+
+# For a new feature
+git checkout -b feat/custom-serializer
+```
+
+---
+
+## Running Tests
+
+All unit and integration tests are written in Jest and run in-band to prevent concurrent Redis state conflicts across suites.
+
+Ensure your local Redis server is running:
+
+```bash
+# Verify Redis is responsive
+redis-cli ping
+# Output: PONG
+```
+
+Run the test suite:
+
 ```bash
 npm test
 ```
-Make sure all tests pass before submitting a PR.
 
-### 5. Commit clearly
-```bash
-git commit -m "feat: add concurrency support"
-```
+> [!NOTE]
+> The test suite flushes Redis during execution (`redis.flushall()`). Do not point `npm test` against a production or shared Redis database.
 
-#### Commit prefixes:
-
-- feat: new feature
-- fix: bug fix
-- docs: documentation changes
-- refactor: code cleanup
-
-### 6. Submit a Pull Request
-Open a PR describing:
-
-- What you changed
-- Why you changed it
-- Any breaking behavior
-
-## 🧠 Contribution Guidelines
-- Keep the library lightweight.
-- Avoid heavy abstractions.
-- Focus on production-oriented reliability features.
-- Maintain backward compatibility whenever possible.
-
-## 🙌 Code of Conduct
-Be respectful and constructive.
-We aim to maintain a welcoming and professional environment.
+All tests must pass before submitting a pull request.
 
 ---
-Thank you for helping improve Resilient Queue.
+
+## Code Guidelines
+
+1. **Lightweight & Dependency-Minimal**: The library relies exclusively on `ioredis` and `uuid`. Avoid introducing additional third-party dependencies unless strictly necessary.
+2. **CommonJS**: The package uses CommonJS (`require` and `module.exports`) to maintain broad Node.js ecosystem compatibility.
+3. **TypeScript Definitions**: If you modify public API signatures, options, or data structures, update `index.d.ts` accordingly.
+4. **Documentation**: Update relevant guides in `docs/` and `README.md` for any user-facing API or configuration changes.
+5. **No Breaking Changes**: Maintain backward compatibility whenever feasible. If a breaking change is unavoidable, clearly highlight it in the PR description.
+
+---
+
+## Commit Message Guidelines
+
+We follow Conventional Commits formatting:
+
+```text
+<type>(<scope>): <short description>
+```
+
+Common types:
+- `feat`: A new feature or capability.
+- `fix`: A bug fix.
+- `docs`: Documentation updates.
+- `refactor`: Code reorganization without functional changes.
+- `test`: Adding or updating test cases.
+- `chore`: Build tools, package metadata, or dependency updates.
+
+Example:
+```bash
+git commit -m "fix(stalled): fence lock renewal when lease is lost"
+```
+
+---
+
+## Pull Request Process
+
+1. Push your branch to your fork on GitHub:
+   ```bash
+   git push origin feat/your-feature-name
+   ```
+2. Open a Pull Request against the `main` branch.
+3. Fill out the PR description with:
+   - What was changed and why.
+   - Any edge cases considered.
+   - Confirmation that `npm test` passed locally.
+4. Maintainers will review your submission and provide feedback.
+
+---
+
+## Code of Conduct
+
+All contributors and maintainers are expected to abide by our [Code of Conduct](./CODE_OF_CONDUCT.md).
+
+---
+
+## Security
+
+To report security vulnerabilities, please refer to our [Security Policy](./SECURITY.md).
