@@ -375,32 +375,28 @@ class RedisClient {
   async disconnect() {
     const promises = [];
 
-    if (this.ownsProducer && this.producer) {
-      if (typeof this.producer.quit === "function") {
-        promises.push(
-          this.producer.quit().catch(() => {
-            if (typeof this.producer.disconnect === "function") {
-              this.producer.disconnect();
-            }
-          })
-        );
-      } else if (typeof this.producer.disconnect === "function") {
-        this.producer.disconnect();
+    const closeConnection = async (client) => {
+      if (!client) return;
+      try {
+        if (typeof client.quit === "function") {
+          await client.quit();
+        } else if (typeof client.disconnect === "function") {
+          client.disconnect();
+        }
+      } catch {
+        // Safe fallback if quit fails
+        if (typeof client.disconnect === "function") {
+          client.disconnect();
+        }
       }
+    };
+
+    if (this.ownsProducer && this.producer) {
+      promises.push(closeConnection(this.producer));
     }
 
     if (this.ownsConsumer && this.consumer) {
-      if (typeof this.consumer.quit === "function") {
-        promises.push(
-          this.consumer.quit().catch(() => {
-            if (typeof this.consumer.disconnect === "function") {
-              this.consumer.disconnect();
-            }
-          })
-        );
-      } else if (typeof this.consumer.disconnect === "function") {
-        this.consumer.disconnect();
-      }
+      promises.push(closeConnection(this.consumer));
     }
 
     await Promise.all(promises);

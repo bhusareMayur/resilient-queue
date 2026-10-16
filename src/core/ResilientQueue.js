@@ -217,20 +217,33 @@ class ResilientQueue {
       return [];
     }
 
+    const defOpts =
+      defaultOptions && typeof defaultOptions === "object" && !Array.isArray(defaultOptions)
+        ? defaultOptions
+        : {};
+
     const prepared = [];
     for (const item of jobs) {
       let data;
       let itemOptions = {};
 
-      if (item && typeof item === "object" && "data" in item) {
+      if (item && typeof item === "object" && !Array.isArray(item) && "data" in item) {
         data = item.data;
         const { data: _, options: itemOpts, opts: itemOpts2, ...directOpts } = item;
-        itemOptions = Object.assign({}, directOpts, itemOpts2, itemOpts);
+        const safeOpts =
+          itemOpts && typeof itemOpts === "object" && !Array.isArray(itemOpts)
+            ? itemOpts
+            : {};
+        const safeOpts2 =
+          itemOpts2 && typeof itemOpts2 === "object" && !Array.isArray(itemOpts2)
+            ? itemOpts2
+            : {};
+        itemOptions = Object.assign({}, directOpts, safeOpts2, safeOpts);
       } else {
         data = item;
       }
 
-      const mergedOptions = Object.assign({}, defaultOptions || {}, itemOptions);
+      const mergedOptions = Object.assign({}, defOpts, itemOptions);
       prepared.push(this._prepareJob(data, mergedOptions));
     }
 

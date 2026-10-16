@@ -1951,6 +1951,16 @@ describe("High-Throughput Batch Enqueuing (enqueueMany)", () => {
 
     expect(ids2).toEqual(ids1);
     expect(await redis.llen("rq:main")).toBe(2);
+
+    // Call enqueueMany with duplicate idempotency keys within the same batch
+    const ids3 = await queue.enqueueMany([
+      { data: { orderId: 103 }, idempotencyKey: "batch-order-103" },
+      { data: { orderId: 103, duplicate: true }, idempotencyKey: "batch-order-103" },
+    ]);
+
+    expect(ids3.length).toBe(2);
+    expect(ids3[0]).toBe(ids3[1]);
+    expect(await redis.llen("rq:main")).toBe(3);
   });
 
   test("supports mixed payload formats ({ data } or plain values)", async () => {
