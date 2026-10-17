@@ -4,9 +4,9 @@ Thank you for your interest in contributing to `@mayurbhusare/resilient-queue`. 
 
 ---
 
-## Maintenance Mode Note
+## Active Development & Contributions
 
-This project is in maintenance mode. We actively review and merge pull requests that address bugs, reliability issues, security concerns, and documentation accuracy. Large feature proposals or architectural overhauls should be discussed in an issue before submitting code.
+This project is actively maintained. We welcome pull requests and issues that address bugs, reliability enhancements, performance optimizations, feature additions, and documentation improvements. For substantial architectural changes or new features, opening an issue first is recommended to discuss the design.
 
 ---
 
