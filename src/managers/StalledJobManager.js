@@ -22,6 +22,7 @@ class StalledJobManager {
     this.maxRetries = options.maxRetries ?? 3;
     this.onStalled = options.onStalled || null;
     this.onDLQ = options.onDLQ || null;
+    this.jobStateManager = options.jobStateManager || null;
 
     // Heartbeat runs roughly at 1/3 of the lock duration.
     this.heartbeatInterval = Math.max(100, Math.floor(this.lockDuration / 3));
@@ -307,6 +308,18 @@ class StalledJobManager {
             -- Persist recovery metadata outside the raw job data
             redis.call('HSET', KEYS[6], id, cjson.encode(metaData))
 
+            if KEYS[7] and KEYS[7] ~= '' then
+              local jobKey = KEYS[7] .. ':job:' .. id
+              if redis.call('EXISTS', jobKey) == 1 then
+                if count > maxStalledCount or nextAttempt > maxRetries then
+                  redis.call('HSET', jobKey, 'state', 'failed', 'failedAt', now, 'failureReason', metaData.failureReason, 'stalledCount', count, 'attempt', nextAttempt)
+                else
+                  redis.call('HSET', jobKey, 'state', 'waiting', 'stalledCount', count, 'lastStalledAt', now, 'attempt', nextAttempt)
+                  redis.call('PERSIST', jobKey)
+                end
+              end
+            end
+
             rec = rec + 1
             break
           end
@@ -331,13 +344,14 @@ class StalledJobManager {
 
     const result = await this.producer.eval(
       script,
-      6,
+      7,
       this.locksKey,
       this.activeQueueKey,
       this.mainQueueKey,
       this.dlqKey,
       this.tokensKey,
       this.stalledMetaKey,
+      this.keyPrefix,
       Date.now(),
       this.maxStalledCount,
       this.lockDuration,
@@ -372,8 +386,13 @@ class StalledJobManager {
 
       if (type === "stalled" && typeof this.onStalled === "function") {
         this.onStalled(job);
-      } else if (type === "dlq" && typeof this.onDLQ === "function") {
-        this.onDLQ(job, meta.failureReason || "Job stalled");
+      } else if (type === "dlq") {
+        if (this.jobStateManager && job && job.id) {
+          await this.jobStateManager.applyRetention(job.id, "failed", job.removeOnFail, Date.now());
+        }
+        if (typeof this.onDLQ === "function") {
+          this.onDLQ(job, meta.failureReason || "Job stalled");
+        }
       }
     }
 

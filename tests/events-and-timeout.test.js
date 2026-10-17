@@ -271,7 +271,9 @@ describe("Event Emitter Observability Hooks", () => {
     await queue.enqueue({ item: 1 });
     await queue.enqueue({ item: 2 });
 
-    await waitForCondition(() => processedCount === 2);
+    await waitForCondition(async () => {
+      return processedCount === 2 && (await redis.llen("rq:active")) === 0;
+    });
 
     expect(processedCount).toBe(2);
     expect(await redis.llen("rq:active")).toBe(0);

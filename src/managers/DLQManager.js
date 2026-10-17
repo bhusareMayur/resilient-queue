@@ -117,6 +117,7 @@ const RETRY_SINGLE_SCRIPT = `
   local dlqKey = KEYS[1]
   local mainKey = KEYS[2]
   local metaKey = KEYS[3]
+  local prefix = KEYS[4]
   local targetId = ARGV[1]
 
   if not targetId or targetId == '' then
@@ -133,6 +134,15 @@ const RETRY_SINGLE_SCRIPT = `
         if resetRaw then
           redis.call('RPUSH', mainKey, resetRaw)
           redis.call('HDEL', metaKey, targetId)
+          if prefix and prefix ~= '' then
+            local jobKey = prefix .. ':job:' .. targetId
+            if redis.call('EXISTS', jobKey) == 1 then
+              redis.call('HSET', jobKey, 'state', 'waiting', 'attempt', '0', 'progress', '0')
+              redis.call('HDEL', jobKey, 'failedAt', 'failureReason', 'lastError')
+              redis.call('PERSIST', jobKey)
+            end
+            redis.call('ZREM', prefix .. ':failed', targetId)
+          end
           return 1
         else
           redis.call('RPUSH', dlqKey, rawJob)
@@ -157,6 +167,7 @@ const RETRY_ALL_SCRIPT = `
   local dlqKey = KEYS[1]
   local mainKey = KEYS[2]
   local metaKey = KEYS[3]
+  local prefix = KEYS[4]
   local limit = tonumber(ARGV[1])
   local count = 0
 
@@ -174,6 +185,15 @@ const RETRY_ALL_SCRIPT = `
         if resetRaw then
           redis.call('RPUSH', mainKey, resetRaw)
           redis.call('HDEL', metaKey, tostring(obj.id))
+          if prefix and prefix ~= '' then
+            local jobKey = prefix .. ':job:' .. tostring(obj.id)
+            if redis.call('EXISTS', jobKey) == 1 then
+              redis.call('HSET', jobKey, 'state', 'waiting', 'attempt', '0', 'progress', '0')
+              redis.call('HDEL', jobKey, 'failedAt', 'failureReason', 'lastError')
+              redis.call('PERSIST', jobKey)
+            end
+            redis.call('ZREM', prefix .. ':failed', tostring(obj.id))
+          end
           count = count + 1
         else
           redis.call('RPUSH', dlqKey, rawJob)
@@ -188,6 +208,7 @@ const RETRY_ALL_SCRIPT = `
 const REMOVE_JOB_SCRIPT = `
   local dlqKey = KEYS[1]
   local metaKey = KEYS[2]
+  local prefix = KEYS[3]
   local targetId = ARGV[1]
 
   if not targetId or targetId == '' then
@@ -201,6 +222,10 @@ const REMOVE_JOB_SCRIPT = `
       local removed = redis.call('LREM', dlqKey, 1, rawJob)
       if removed > 0 then
         redis.call('HDEL', metaKey, targetId)
+        if prefix and prefix ~= '' then
+          redis.call('DEL', prefix .. ':job:' .. targetId)
+          redis.call('ZREM', prefix .. ':failed', targetId)
+        end
         return 1
       end
     end
@@ -212,6 +237,7 @@ const REMOVE_JOB_SCRIPT = `
 const PURGE_SCRIPT = `
   local dlqKey = KEYS[1]
   local metaKey = KEYS[2]
+  local prefix = KEYS[3]
 
   local total = redis.call('LLEN', dlqKey)
   if total == 0 then
@@ -223,6 +249,10 @@ const PURGE_SCRIPT = `
     local ok, obj = pcall(cjson.decode, rawJob)
     if ok and obj and type(obj) == 'table' and obj.id then
       redis.call('HDEL', metaKey, tostring(obj.id))
+      if prefix and prefix ~= '' then
+        redis.call('DEL', prefix .. ':job:' .. tostring(obj.id))
+        redis.call('ZREM', prefix .. ':failed', tostring(obj.id))
+      end
     end
   end
 
@@ -249,6 +279,7 @@ class DLQManager {
     this.redis = redisClient;
     this.keyPrefix = prefix;
     this.onDLQ = opts?.onDLQ || null;
+    this.jobStateManager = opts?.jobStateManager || null;
     this.dlqKey = `${this.keyPrefix}:dlq`;
     this.mainQueueKey = `${this.keyPrefix}:main`;
     this.stalledMetaKey = `${this.keyPrefix}:stalled_meta`;
@@ -265,6 +296,11 @@ class DLQManager {
     };
 
     await this.redis.rpush(this.dlqKey, JSON.stringify(failedJob));
+
+    if (this.jobStateManager && job && job.id) {
+      const retention = job.removeOnFail ?? job._retentionOptions?.removeOnFail;
+      await this.jobStateManager.transitionToFailed(job.id, reason, retention);
+    }
 
     if (typeof this.onDLQ === "function") {
       this.onDLQ(failedJob, reason);
@@ -399,10 +435,11 @@ class DLQManager {
     const targetId = String(jobId);
     const result = await this.redis.eval(
       RETRY_SINGLE_SCRIPT,
-      3,
+      4,
       this.dlqKey,
       this.mainQueueKey,
       this.stalledMetaKey,
+      this.keyPrefix,
       targetId
     );
 
@@ -427,10 +464,11 @@ class DLQManager {
     const limitArg = typeof limit === "number" && limit > 0 ? limit : 0;
     const result = await this.redis.eval(
       RETRY_ALL_SCRIPT,
-      3,
+      4,
       this.dlqKey,
       this.mainQueueKey,
       this.stalledMetaKey,
+      this.keyPrefix,
       limitArg
     );
 
@@ -448,9 +486,10 @@ class DLQManager {
     const targetId = String(jobId);
     const result = await this.redis.eval(
       REMOVE_JOB_SCRIPT,
-      2,
+      3,
       this.dlqKey,
       this.stalledMetaKey,
+      this.keyPrefix,
       targetId
     );
 
@@ -463,9 +502,10 @@ class DLQManager {
   async purgeDLQ() {
     const result = await this.redis.eval(
       PURGE_SCRIPT,
-      2,
+      3,
       this.dlqKey,
-      this.stalledMetaKey
+      this.stalledMetaKey,
+      this.keyPrefix
     );
 
     return Number(result);

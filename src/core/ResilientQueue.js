@@ -7,6 +7,7 @@ const DLQManager = require("../managers/DLQManager");
 const RetryManager = require("../managers/RetryManager");
 const StalledJobManager = require("../managers/StalledJobManager");
 const { JobTimeoutError } = require("../errors/Errors");
+const JobStateManager = require("../managers/JobStateManager");
 
 /**
  * Main queue class.
@@ -36,7 +37,9 @@ class ResilientQueue extends EventEmitter {
       stalledInterval = 15000,
       lockDuration = 30000,
       maxStalledCount = 1,
-      jobTimeout = null
+      jobTimeout = null,
+      removeOnComplete,
+      removeOnFail
     } = options;
 
     if (
@@ -84,6 +87,9 @@ class ResilientQueue extends EventEmitter {
       (typeof backoff === "object" && backoff !== null ? backoff.maxDelay : undefined) ??
       60000;
 
+    this.removeOnComplete = JobStateManager.normalizeRetentionPolicy(removeOnComplete);
+    this.removeOnFail = JobStateManager.normalizeRetentionPolicy(removeOnFail);
+
     this.jobTimeout = jobTimeout || null;
     this.maxRetries = resolvedMaxRetries;
     this.baseDelay = resolvedBaseDelay;
@@ -123,6 +129,15 @@ class ResilientQueue extends EventEmitter {
     this.producer = this.redisClientWrapper.getProducer();
     this.consumer = this.redisClientWrapper.getConsumer();
 
+    this.jobStateManager = new JobStateManager(
+      this.producer,
+      keyPrefix,
+      {
+        removeOnComplete: this.removeOnComplete,
+        removeOnFail: this.removeOnFail
+      }
+    );
+
     this.idempotencyManager = new IdempotencyManager(
       this.producer,
       keyPrefix
@@ -132,6 +147,7 @@ class ResilientQueue extends EventEmitter {
       this.producer,
       keyPrefix,
       {
+        jobStateManager: this.jobStateManager,
         onDLQ: (job, reason) => {
           if (job && job.id) {
             this.customJobBackoffFns.delete(job.id);
@@ -145,6 +161,7 @@ class ResilientQueue extends EventEmitter {
       this.producer,
       this.dlqManager,
       {
+        jobStateManager: this.jobStateManager,
         maxRetries: resolvedMaxRetries,
         baseDelay: resolvedBaseDelay,
         maxDelay: resolvedMaxDelay,
@@ -161,6 +178,7 @@ class ResilientQueue extends EventEmitter {
     this.stalledJobManager = new StalledJobManager(
       this.producer,
       {
+        jobStateManager: this.jobStateManager,
         keyPrefix,
         stalledInterval,
         lockDuration,
@@ -216,7 +234,9 @@ class ResilientQueue extends EventEmitter {
       strategy,
       jitter,
       backoff,
-      fn
+      fn,
+      removeOnComplete,
+      removeOnFail
     } = options || {};
 
     if (ttlSeconds !== undefined && ttlSeconds !== null) {
@@ -240,6 +260,16 @@ class ResilientQueue extends EventEmitter {
       backoff,
       fn
     });
+
+    let resolvedRemoveOnComplete = this.removeOnComplete;
+    if (options && "removeOnComplete" in options && options.removeOnComplete !== undefined) {
+      resolvedRemoveOnComplete = JobStateManager.normalizeRetentionPolicy(options.removeOnComplete);
+    }
+
+    let resolvedRemoveOnFail = this.removeOnFail;
+    if (options && "removeOnFail" in options && options.removeOnFail !== undefined) {
+      resolvedRemoveOnFail = JobStateManager.normalizeRetentionPolicy(options.removeOnFail);
+    }
 
     let isDelayed = false;
     let executeAt = null;
@@ -280,6 +310,14 @@ class ResilientQueue extends EventEmitter {
       ttlSeconds: ttlSeconds ?? null,
       createdAt: Date.now()
     };
+
+    if (resolvedRemoveOnComplete !== null && resolvedRemoveOnComplete !== undefined) {
+      job.removeOnComplete = resolvedRemoveOnComplete;
+    }
+
+    if (resolvedRemoveOnFail !== null && resolvedRemoveOnFail !== undefined) {
+      job.removeOnFail = resolvedRemoveOnFail;
+    }
 
     if (jobTimeout !== undefined && jobTimeout !== null) {
       job.jobTimeout = jobTimeout;
@@ -337,7 +375,9 @@ class ResilientQueue extends EventEmitter {
       isDelayed,
       executeAt,
       idempotencyKey: idempotencyKey || null,
-      ttlSeconds: ttlSeconds ?? null
+      ttlSeconds: ttlSeconds ?? null,
+      removeOnComplete: resolvedRemoveOnComplete,
+      removeOnFail: resolvedRemoveOnFail
     };
   }
 
@@ -348,7 +388,10 @@ class ResilientQueue extends EventEmitter {
     const { job, isDelayed, executeAt, idempotencyKey, ttlSeconds } =
       this._prepareJob(data, options);
 
+    const initialJobState = isDelayed ? "delayed" : "waiting";
+
     if (isDelayed) {
+      await this.jobStateManager.saveJob(job, initialJobState, options);
       if (!idempotencyKey) {
         await this.producer.zadd(
           this.delayedQueueKey,
@@ -359,15 +402,22 @@ class ResilientQueue extends EventEmitter {
         return job.id;
       }
 
-      return await this.idempotencyManager.registerAndEnqueueDelayed(
+      const finalJobId = await this.idempotencyManager.registerAndEnqueueDelayed(
         this.delayedQueueKey,
         idempotencyKey,
         job,
         executeAt,
         ttlSeconds
       );
+
+      if (finalJobId !== job.id) {
+        await this.jobStateManager.cleanupJob(job.id);
+      }
+
+      return finalJobId;
     }
 
+    await this.jobStateManager.saveJob(job, initialJobState, options);
     if (!idempotencyKey) {
       await this.producer.rpush(
         this.mainQueueKey,
@@ -377,12 +427,18 @@ class ResilientQueue extends EventEmitter {
       return job.id;
     }
 
-    return await this.idempotencyManager.registerAndEnqueue(
+    const finalJobId = await this.idempotencyManager.registerAndEnqueue(
       this.mainQueueKey,
       idempotencyKey,
       job,
       ttlSeconds
     );
+
+    if (finalJobId !== job.id) {
+      await this.jobStateManager.cleanupJob(job.id);
+    }
+
+    return finalJobId;
   }
 
   /**
@@ -432,6 +488,9 @@ class ResilientQueue extends EventEmitter {
     for (const item of prepared) {
       const { job, isDelayed, executeAt, idempotencyKey, ttlSeconds } = item;
       const serialized = JSON.stringify(job);
+      const initialJobState = isDelayed ? "delayed" : "waiting";
+
+      this.jobStateManager.appendSaveJob(pipeline, job, initialJobState, item);
 
       if (isDelayed) {
         if (!idempotencyKey) {
@@ -468,15 +527,24 @@ class ResilientQueue extends EventEmitter {
     }
 
     const jobIds = [];
-    for (let i = 0; i < results.length; i++) {
-      const [err, res] = results[i];
-      if (err) {
-        throw err;
+    for (let i = 0; i < prepared.length; i++) {
+      const [hsetErr] = results[i * 2];
+      if (hsetErr) {
+        throw hsetErr;
+      }
+
+      const [enqErr, enqRes] = results[i * 2 + 1];
+      if (enqErr) {
+        throw enqErr;
       }
 
       const item = prepared[i];
       if (item.idempotencyKey) {
-        jobIds.push(res || item.job.id);
+        const finalId = enqRes || item.job.id;
+        if (finalId !== item.job.id) {
+          this.jobStateManager.cleanupJob(item.job.id).catch(() => {});
+        }
+        jobIds.push(finalId);
       } else {
         jobIds.push(item.job.id);
       }
@@ -623,12 +691,24 @@ class ResilientQueue extends EventEmitter {
           const result = await handler(job);
           if (!job.isLeaseLost && !completedEmitted) {
             completedEmitted = true;
+            job.state = "completed";
+            job.result = result;
+            job.returnValue = result;
+            job.completedAt = Date.now();
             this.customJobBackoffFns.delete(job.id);
+            await this.jobStateManager.transitionToCompleted(
+              job.id,
+              result,
+              job.removeOnComplete
+            );
             this._safeEmit("completed", job, result);
           }
         } catch (error) {
           if (!job.isLeaseLost && !failedEmitted) {
             failedEmitted = true;
+            job.state = "failed";
+            job.failedAt = Date.now();
+            job.failureReason = error?.message || (typeof error === "string" ? error : "Unknown error");
             this._safeEmit("failed", job, error);
             await this.retryManager.handleFailure(job, error, options);
           }
@@ -669,12 +749,24 @@ class ResilientQueue extends EventEmitter {
         const result = await Promise.race([handlerPromise, timeoutPromise]);
         if (!job.isLeaseLost && !timedOut && !completedEmitted) {
           completedEmitted = true;
+          job.state = "completed";
+          job.result = result;
+          job.returnValue = result;
+          job.completedAt = Date.now();
           this.customJobBackoffFns.delete(job.id);
+          await this.jobStateManager.transitionToCompleted(
+            job.id,
+            result,
+            job.removeOnComplete
+          );
           this._safeEmit("completed", job, result);
         }
       } catch (error) {
         if (!job.isLeaseLost && !failedEmitted) {
           failedEmitted = true;
+          job.state = "failed";
+          job.failedAt = Date.now();
+          job.failureReason = error?.message || (typeof error === "string" ? error : "Unknown error");
           this._safeEmit("failed", job, error);
         }
 
@@ -783,6 +875,24 @@ class ResilientQueue extends EventEmitter {
 
           // Acquire lock with fencing token
           await this.stalledJobManager.acquireLock(job.id, lockToken);
+
+          // Transition job to 'active'
+          await this.jobStateManager.transitionToActive(job.id, job.attempt);
+          job.state = "active";
+          job.progress = job.progress !== undefined ? job.progress : 0;
+          job.startedAt = Date.now();
+
+          // Attach asynchronous updateProgress method
+          job.updateProgress = async (progress) => {
+            try {
+              await this.jobStateManager.updateProgress(job.id, progress);
+              job.progress = progress;
+              this._safeEmit("progress", job, progress);
+            } catch (err) {
+              this._safeEmit("error", err);
+              throw err;
+            }
+          };
 
           // Start heartbeat with fencing token and lease loss callback
           this.stalledJobManager.startHeartbeat(job.id, lockToken, () => {
@@ -894,6 +1004,27 @@ class ResilientQueue extends EventEmitter {
       }
       await this.redisClientWrapper.disconnect();
     }
+  }
+
+  /**
+   * Retrieves persisted job details from Redis by ID.
+   * Returns null when the job is missing or expired according to retention policy.
+   *
+   * @param {string} id Unique identifier of the job.
+   * @returns {Promise<object|null>}
+   */
+  async getJob(id) {
+    if (this.isClosed) {
+      throw new Error("Queue is closed");
+    }
+    return await this.jobStateManager.getJob(id, {
+      onUpdateProgress: (job, progress) => {
+        this._safeEmit("progress", job, progress);
+      },
+      onError: (err) => {
+        this._safeEmit("error", err);
+      }
+    });
   }
 
   /**

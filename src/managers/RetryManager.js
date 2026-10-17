@@ -160,6 +160,7 @@ class RetryManager {
 
     this.keyPrefix = options.keyPrefix ?? "rq";
     this.onRetrying = options.onRetrying ?? null;
+    this.jobStateManager = options.jobStateManager ?? null;
   }
 
   /**
@@ -320,6 +321,14 @@ class RetryManager {
         executeAt,
         JSON.stringify(retryJob)
       );
+      if (this.jobStateManager) {
+        await this.jobStateManager.transitionToDelayed(
+          retryJob.id,
+          nextAttempt,
+          error,
+          executeAt
+        );
+      }
       if (typeof this.onRetrying === "function") {
         this.onRetrying(retryJob, error, nextAttempt, delay);
       }
@@ -367,6 +376,15 @@ async promoteDueRetries() {
   for _, job in ipairs(jobs) do
     if redis.call('ZREM', KEYS[1], job) == 1 then
       redis.call('RPUSH', KEYS[2], job)
+      if KEYS[3] and KEYS[3] ~= '' then
+        local ok, obj = pcall(cjson.decode, job)
+        if ok and obj and obj.id then
+          local jobKey = KEYS[3] .. ':job:' .. obj.id
+          if redis.call('EXISTS', jobKey) == 1 then
+            redis.call('HSET', jobKey, 'state', 'waiting')
+          end
+        end
+      end
     end
   end
 
@@ -375,9 +393,10 @@ async promoteDueRetries() {
 
   return this.redis.eval(
     script,
-    2,
+    3,
     delayedQueueKey,
     mainQueueKey,
+    this.keyPrefix,
     Date.now(),
     100
   );
