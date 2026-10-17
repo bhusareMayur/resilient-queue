@@ -1,9 +1,8 @@
-> [!NOTE]
-> **Maintenance Mode**: This project is in maintenance mode. Contributions, bug fixes, and improvements are welcome. Please check out [CONTRIBUTING.md](./CONTRIBUTING.md) to get started.
-
 # @mayurbhusare/resilient-queue
 
 [![npm version](https://img.shields.io/npm/v/@mayurbhusare/resilient-queue?style=flat-square&color=cb3837)](https://www.npmjs.com/package/@mayurbhusare/resilient-queue)
+[![status](https://img.shields.io/badge/status-actively%20maintained-brightgreen?style=flat-square)](https://github.com/bhusareMayur/resilient-queue)
+[![production ready](https://img.shields.io/badge/production-ready-blue?style=flat-square)](https://github.com/bhusareMayur/resilient-queue)
 [![license](https://img.shields.io/npm/l/@mayurbhusare/resilient-queue?style=flat-square&color=blue)](./LICENSE)
 [![tests](https://img.shields.io/badge/tests-164%20passed-brightgreen?style=flat-square)](https://github.com/bhusareMayur/resilient-queue)
 
