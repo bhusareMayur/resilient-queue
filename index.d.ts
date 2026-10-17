@@ -1,3 +1,4 @@
+import { EventEmitter } from "events";
 import type { Redis, Cluster, RedisOptions, ClusterOptions, ClusterNode } from "ioredis";
 
 /**
@@ -55,7 +56,7 @@ export interface Job<T = any> {
   lastStalledAt?: number;
 
   /**
-   * Standard AbortSignal triggered if the job lease is lost (e.g. stalled or recovered by another worker).
+   * Standard AbortSignal triggered if the job lease is lost (e.g. stalled or recovered by another worker) or on timeout.
    */
   signal?: AbortSignal;
 
@@ -78,6 +79,16 @@ export interface Job<T = any> {
    * Unix timestamp (in milliseconds) when the job is scheduled to execute.
    */
   runAt?: number;
+
+  /**
+   * Optional execution timeout in milliseconds applied to this job.
+   */
+  jobTimeout?: number;
+
+  /**
+   * Boolean flag indicating whether this job execution exceeded its configured execution timeout.
+   */
+  isTimedOut?: boolean;
 }
 
 /**
@@ -192,6 +203,11 @@ export interface QueueOptions {
    * @default 1
    */
   maxStalledCount?: number;
+
+  /**
+   * Default execution timeout in milliseconds for jobs processed by this queue.
+   */
+  jobTimeout?: number;
 }
 
 /**
@@ -217,6 +233,11 @@ export interface EnqueueOptions {
    * Exact Date or Unix timestamp (in milliseconds) when the job should run.
    */
   runAt?: Date | number;
+
+  /**
+   * Optional execution timeout in milliseconds for this specific job, overriding worker and queue defaults.
+   */
+  jobTimeout?: number;
 }
 
 /**
@@ -248,6 +269,11 @@ export interface ProcessOptions {
    * @default 1
    */
   concurrency?: number;
+
+  /**
+   * Optional worker-level execution timeout in milliseconds, overriding the queue default.
+   */
+  jobTimeout?: number;
 }
 
 /**
@@ -342,15 +368,86 @@ export interface RetryAllDLQOptions {
 export type JobHandler<T = any> = (job: Job<T>) => Promise<void> | void;
 
 /**
+ * Event signatures for ResilientQueue lifecycle events.
+ */
+export interface ResilientQueueEvents<T = any> {
+  /**
+   * Emitted when a job has completed successfully.
+   */
+  completed: (job: Job<T>, result: any) => void;
+
+  /**
+   * Emitted when an execution attempt has failed.
+   */
+  failed: (job: Job<T>, error: Error) => void;
+
+  /**
+   * Emitted when a retry is scheduled with exponential backoff.
+   */
+  retrying: (job: Job<T>, error: Error, attempt: number, delayMs: number) => void;
+
+  /**
+   * Emitted when a job is moved to the Dead-Letter Queue (DLQ).
+   */
+  dlq: (job: DLQJob<T> | Job<T>, reason: Error | string) => void;
+
+  /**
+   * Emitted when a stalled job is successfully recovered.
+   */
+  stalled: (job: Job<T>) => void;
+
+  /**
+   * Emitted when an error is encountered in an event listener.
+   */
+  error: (error: Error) => void;
+}
+
+/**
  * Main ResilientQueue class.
  */
-export class ResilientQueue {
+export class ResilientQueue extends EventEmitter {
   /**
    * Creates a new ResilientQueue instance.
    *
    * @param options Configuration options.
    */
   constructor(options: QueueOptions);
+
+  on<E extends keyof ResilientQueueEvents<T>, T = any>(
+    event: E,
+    listener: ResilientQueueEvents<T>[E]
+  ): this;
+  on(event: string | symbol, listener: (...args: any[]) => void): this;
+
+  once<E extends keyof ResilientQueueEvents<T>, T = any>(
+    event: E,
+    listener: ResilientQueueEvents<T>[E]
+  ): this;
+  once(event: string | symbol, listener: (...args: any[]) => void): this;
+
+  emit<E extends keyof ResilientQueueEvents<T>, T = any>(
+    event: E,
+    ...args: Parameters<ResilientQueueEvents<T>[E]>
+  ): boolean;
+  emit(event: string | symbol, ...args: any[]): boolean;
+
+  addListener<E extends keyof ResilientQueueEvents<T>, T = any>(
+    event: E,
+    listener: ResilientQueueEvents<T>[E]
+  ): this;
+  addListener(event: string | symbol, listener: (...args: any[]) => void): this;
+
+  removeListener<E extends keyof ResilientQueueEvents<T>, T = any>(
+    event: E,
+    listener: ResilientQueueEvents<T>[E]
+  ): this;
+  removeListener(event: string | symbol, listener: (...args: any[]) => void): this;
+
+  off<E extends keyof ResilientQueueEvents<T>, T = any>(
+    event: E,
+    listener: ResilientQueueEvents<T>[E]
+  ): this;
+  off(event: string | symbol, listener: (...args: any[]) => void): this;
 
   /**
    * Enqueues a new job.
@@ -458,4 +555,17 @@ export class RetryableError extends Error {
  */
 export class FatalError extends Error {
   constructor(message?: string);
+}
+
+/**
+ * Error indicating that a job execution timed out.
+ * Extends RetryableError so timeout failures can be retried up to maxRetries before routing to DLQ.
+ */
+export class JobTimeoutError extends RetryableError {
+  /**
+   * The timeout threshold in milliseconds that was exceeded.
+   */
+  timeoutMs?: number | null;
+
+  constructor(message?: string, timeoutMs?: number | null);
 }

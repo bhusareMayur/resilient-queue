@@ -20,11 +20,14 @@ This document provides a comprehensive reference for all exported classes, metho
   - [queue.retryAllDLQ([options])](#queueretryalldlqoptions)
   - [queue.removeDLQJob(jobId)](#queueremovedlqjobjobid)
   - [queue.purgeDLQ()](#queuepurgedlq)
+  - [Lifecycle Events](#lifecycle-events)
 - [Error Classes](#error-classes)
   - [RetryableError](#retryableerror)
   - [FatalError](#fatalerror)
+  - [JobTimeoutError](#jobtimeouterror)
 - [TypeScript Types & Interfaces](#typescript-types-interfaces)
   - [Job<T>](#jobt)
+  - [ResilientQueueEvents<T>](#resilientqueueeventst)
   - [DLQJob<T>](#dlqjobt)
   - [DLQOptions](#dlqoptions)
   - [DLQResult<T>](#dlqresultt)
@@ -41,13 +44,14 @@ This document provides a comprehensive reference for all exported classes, metho
 
 ## Package Exports
 
-The package exports three main constructs:
+The package exports four main constructs:
 
 ```javascript
 const {
   ResilientQueue,
   RetryableError,
-  FatalError
+  FatalError,
+  JobTimeoutError
 } = require("@mayurbhusare/resilient-queue");
 ```
 
@@ -63,11 +67,13 @@ Initializes a new `ResilientQueue` instance.
 
 #### Parameters
 
-- `options` (`QueueOptions`): Configuration options object. See [QueueOptions](#queueoptions) for all fields.
+- `options` (`QueueOptions`): Configuration options object. See [QueueOptions](#queueoptions) for all fields. Includes:
+  - `jobTimeout` (`number`, optional): Default execution timeout in milliseconds for all jobs.
 
 #### Throws
 
 - Throws an `Error` (`"redisUrl or redis options are required to initialize ResilientQueue"`) if no Redis connection configuration is provided.
+- Throws an `Error` (`"jobTimeout must be a positive number"`) if `jobTimeout` is specified and is not a positive number.
 
 #### Example
 
@@ -76,7 +82,8 @@ const queue = new ResilientQueue({
   redisUrl: "redis://127.0.0.1:6379",
   maxRetries: 3,
   baseDelay: 500,
-  keyPrefix: "rq"
+  keyPrefix: "rq",
+  jobTimeout: 5000 // default 5-second timeout
 });
 ```
 
@@ -94,6 +101,7 @@ Pushes a new job to the tail of the main queue or schedules it in the delayed so
   - `ttlSeconds` (`number | null`, optional): TTL in seconds for the idempotency key in Redis. Must be an integer if specified.
   - `delay` (`number`, optional): Delay in milliseconds before the job becomes eligible for processing. Must be a non-negative number.
   - `runAt` (`Date | number`, optional): Exact `Date` object or Unix timestamp in milliseconds when the job should run. Mutually exclusive with `delay`.
+  - `jobTimeout` (`number`, optional): Execution timeout in milliseconds for this specific job, overriding worker and queue defaults.
 
 #### Returns
 
@@ -105,6 +113,7 @@ Pushes a new job to the tail of the main queue or schedules it in the delayed so
 - Throws an `Error` (`"delay must be a non-negative number"`) if `delay` is negative or not a finite number.
 - Throws an `Error` (`"runAt must be a valid Date or timestamp"`) if `runAt` is invalid.
 - Throws an `Error` (`"Cannot specify both delay and runAt"`) if both options are provided.
+- Throws an `Error` (`"jobTimeout must be a positive number"`) if `jobTimeout` is specified and is not a positive number.
 - Throws an `Error` if the Redis destination key type does not match.
 
 #### Example
@@ -129,6 +138,12 @@ const scheduledJobId = await queue.enqueue(
 const idempotentId = await queue.enqueue(
   { transactionId: "txn_789", amount: 100 },
   { idempotencyKey: "txn_789", ttlSeconds: 3600 }
+);
+
+// Enqueue with per-job execution timeout
+const timeoutJobId = await queue.enqueue(
+  { query: "SELECT * FROM large_table" },
+  { jobTimeout: 2000 }
 );
 ```
 
@@ -179,9 +194,10 @@ Starts worker polling and processing jobs from the queue.
 
 #### Parameters
 
-- `handler` (`JobHandler<T>`): An asynchronous or synchronous function invoked for each dequeued job. Receives a `job` object.
+- `handler` (`JobHandler<T>`): An asynchronous or synchronous function invoked for each dequeued job. Receives a `job` object. Handlers can inspect `job.signal` (`AbortSignal`) to cancel ongoing work on timeout or lease loss.
 - `options` (`ProcessOptions`, optional):
   - `concurrency` (`number`, optional): Positive integer specifying how many jobs can run concurrently in this worker instance. Default: `1`.
+  - `jobTimeout` (`number`, optional): Worker-level execution timeout in milliseconds, overriding the queue default.
 
 #### Returns
 
@@ -191,6 +207,7 @@ Starts worker polling and processing jobs from the queue.
 
 - Throws an `Error` (`"A handler function must be provided to process()"`) if `handler` is not a function.
 - Throws an `Error` (`"Concurrency must be a positive integer"`) if `concurrency` is not a positive integer.
+- Throws an `Error` (`"jobTimeout must be a positive number"`) if `jobTimeout` is specified and is not a positive number.
 - Throws an `Error` (`"Queue is already processing"`) if `process()` was already called on this queue instance.
 
 #### Example
@@ -198,8 +215,10 @@ Starts worker polling and processing jobs from the queue.
 ```javascript
 queue.process(async (job) => {
   console.log(`Processing job ${job.id}:`, job.data);
-  // Perform work
-}, { concurrency: 4 });
+  // Pass job.signal to cancel on timeout or lease loss
+  const response = await fetch("https://api.example.com", { signal: job.signal });
+  return await response.json();
+}, { concurrency: 4, jobTimeout: 3000 });
 ```
 
 ---
@@ -398,6 +417,58 @@ console.log(`Purged ${purged} failed jobs from DLQ`);
 
 ---
 
+## Lifecycle Events
+
+`ResilientQueue` extends Node.js's native `EventEmitter`. All event listeners execute inside an isolated boundary; errors thrown synchronously or rejected asynchronously by listener functions do not corrupt queue state, interrupt job processing, or trigger unhandled rejections.
+
+### Event: `'completed'`
+
+- **Signature**: `(job: Job<T>, result: any) => void`
+- **Description**: Emitted immediately when a job handler completes successfully.
+- **Payload**:
+  - `job` (`Job<T>`): The job object that finished processing.
+  - `result` (`any`): The value returned by the worker handler function (or `undefined`).
+
+### Event: `'failed'`
+
+- **Signature**: `(job: Job<T>, error: Error) => void`
+- **Description**: Emitted when a job execution attempt fails (handler throws an error or execution times out).
+- **Payload**:
+  - `job` (`Job<T>`): The job object that encountered the failure.
+  - `error` (`Error`): The error thrown by the handler or a `JobTimeoutError`.
+
+### Event: `'retrying'`
+
+- **Signature**: `(job: Job<T>, error: Error, attempt: number, delayMs: number) => void`
+- **Description**: Emitted when a failed job is scheduled for a delayed retry with exponential backoff.
+- **Payload**:
+  - `job` (`Job<T>`): The updated job object with the new attempt count.
+  - `error` (`Error`): The error causing the retry.
+  - `attempt` (`number`): The upcoming attempt number (e.g. `1`, `2`).
+  - `delayMs` (`number`): The backoff delay in milliseconds before the retry executes.
+
+### Event: `'dlq'`
+
+- **Signature**: `(job: DLQJob<T> | Job<T>, reason: Error | string) => void`
+- **Description**: Emitted when a job is permanently routed to the Dead-Letter Queue (`<keyPrefix>:dlq`).
+- **Payload**:
+  - `job` (`DLQJob<T>`): The job object moved to the DLQ.
+  - `reason` (`Error | string`): The fatal error, exhausted error, or poison pill diagnostic reason.
+
+### Event: `'stalled'`
+
+- **Signature**: `(job: Job<T>) => void`
+- **Description**: Emitted when an abandoned active job (due to worker crash or lost heartbeat) is successfully recovered from `<keyPrefix>:active` back to `<keyPrefix>:main`.
+- **Payload**:
+  - `job` (`Job<T>`): The recovered job object with incremented `stalledCount`.
+
+### Event: `'error'`
+
+- **Signature**: `(error: Error) => void`
+- **Description**: Emitted when an event listener throws a synchronous error or returns a rejected promise, if an `'error'` listener is registered.
+
+---
+
 ## Error Classes
 
 ### `RetryableError`
@@ -447,6 +518,26 @@ new FatalError(message?: string)
 
 ---
 
+### `JobTimeoutError`
+
+```javascript
+class JobTimeoutError extends RetryableError
+```
+
+Indicates that a job's execution exceeded the configured `jobTimeout` threshold in milliseconds. Inherits from `RetryableError`, allowing timeouts to be retried with exponential backoff up to `maxRetries` before routing to the DLQ.
+
+#### Constructor
+
+```javascript
+new JobTimeoutError(message?: string, timeoutMs?: number | null)
+```
+
+- `message`: Description of the timeout failure (defaults to `"Job execution timed out"`).
+- `timeoutMs`: Optional timeout duration in milliseconds that was exceeded.
+- `name`: Set to `"JobTimeoutError"`.
+
+---
+
 ## TypeScript Types & Interfaces
 
 The package includes TypeScript definitions (`index.d.ts`).
@@ -469,6 +560,8 @@ export interface Job<T = any> {
   lastStalledAt?: number;
   signal?: AbortSignal;
   isLeaseLost?: boolean;
+  isTimedOut?: boolean;
+  jobTimeout?: number;
   lockToken?: string;
   delay?: number;
   runAt?: number;
@@ -487,11 +580,39 @@ export interface Job<T = any> {
 | `retriedAt` | `number \| undefined` | Unix timestamp in milliseconds of the most recent retry attempt. |
 | `stalledCount` | `number \| undefined` | Number of times this job stalled and was recovered. |
 | `lastStalledAt` | `number \| undefined` | Unix timestamp in milliseconds when most recently recovered from stalled state. |
-| `signal` | `AbortSignal \| undefined` | Standard `AbortSignal` triggered if the job lease is lost or recovered by another worker. |
+| `signal` | `AbortSignal \| undefined` | Standard `AbortSignal` triggered if the job lease is lost or execution times out. |
 | `isLeaseLost` | `boolean \| undefined` | Boolean indicating whether this worker's visibility lease has expired or was revoked. |
+| `isTimedOut` | `boolean \| undefined` | Boolean indicating whether this job has timed out. |
+| `jobTimeout` | `number \| undefined` | Configured execution timeout in milliseconds for this job. |
 | `lockToken` | `string \| undefined` | Per-dequeue fencing token identifying this execution lease. |
 | `delay` | `number \| undefined` | Optional delay in milliseconds configured during enqueue. |
 | `runAt` | `number \| undefined` | Scheduled execution timestamp in milliseconds. |
+
+---
+
+### `ResilientQueueEvents<T>`
+
+Event listener signatures supported by `ResilientQueue`.
+
+```typescript
+export interface ResilientQueueEvents<T = any> {
+  completed: (job: Job<T>, result: any) => void;
+  failed: (job: Job<T>, error: Error) => void;
+  retrying: (job: Job<T>, error: Error, attempt: number, delayMs: number) => void;
+  dlq: (job: DLQJob<T> | Job<T>, reason: Error | string) => void;
+  stalled: (job: Job<T>) => void;
+  error: (error: Error) => void;
+}
+```
+
+| Event | Signature | Description |
+| :--- | :--- | :--- |
+| `completed` | `(job: Job<T>, result: any) => void` | Emitted when a job handler completes successfully. |
+| `failed` | `(job: Job<T>, error: Error) => void` | Emitted when a job execution attempt fails (includes retries, DLQ, and timeouts). |
+| `retrying` | `(job: Job<T>, error: Error, attempt: number, delayMs: number) => void` | Emitted when a failed job is scheduled for retry in the delayed queue. |
+| `dlq` | `(job: DLQJob<T> \| Job<T>, reason: Error \| string) => void` | Emitted when a job is permanently moved to the Dead-Letter Queue. |
+| `stalled` | `(job: Job<T>) => void` | Emitted when an abandoned stalled job is recovered to the main queue. |
+| `error` | `(error: Error) => void` | Emitted when an internal error occurs or a listener throws. |
 
 ---
 
@@ -594,6 +715,7 @@ export interface QueueOptions {
   stalledInterval?: number; // default: 15000
   lockDuration?: number;    // default: 30000
   maxStalledCount?: number; // default: 1
+  jobTimeout?: number;      // default: undefined (disabled)
 }
 ```
 
@@ -607,6 +729,7 @@ export interface EnqueueOptions {
   ttlSeconds?: number | null;
   delay?: number;
   runAt?: Date | number;
+  jobTimeout?: number;
 }
 ```
 
@@ -629,6 +752,7 @@ export interface EnqueueManyItem<T = any> extends EnqueueOptions {
 ```typescript
 export interface ProcessOptions {
   concurrency?: number; // default: 1
+  jobTimeout?: number;
 }
 ```
 

@@ -20,6 +20,8 @@ class StalledJobManager {
     this.stalledInterval = options.stalledInterval ?? 15000;
     this.maxStalledCount = options.maxStalledCount ?? 1;
     this.maxRetries = options.maxRetries ?? 3;
+    this.onStalled = options.onStalled || null;
+    this.onDLQ = options.onDLQ || null;
 
     // Heartbeat runs roughly at 1/3 of the lock duration.
     this.heartbeatInterval = Math.max(100, Math.floor(this.lockDuration / 3));
@@ -254,6 +256,7 @@ class StalledJobManager {
       local expired = redis.call('ZRANGEBYSCORE', KEYS[1], '-inf', now)
       local active = redis.call('LRANGE', KEYS[2], 0, -1)
       local recoveredSet = {}
+      local events = {}
 
       for _, id in ipairs(expired) do
         for _, j in ipairs(active) do
@@ -294,9 +297,11 @@ class StalledJobManager {
               end
               -- Move the pristine raw string j directly to DLQ without re-encoding
               redis.call('RPUSH', KEYS[4], j)
+              table.insert(events, {'dlq', j, cjson.encode(metaData)})
             else
               -- Move the pristine raw string j directly to main queue without re-encoding
               redis.call('RPUSH', KEYS[3], j)
+              table.insert(events, {'stalled', j, cjson.encode(metaData)})
             end
 
             -- Persist recovery metadata outside the raw job data
@@ -321,10 +326,10 @@ class StalledJobManager {
         end
       end
 
-      return rec
+      return { rec, events }
     `;
 
-    return this.producer.eval(
+    const result = await this.producer.eval(
       script,
       6,
       this.locksKey,
@@ -338,6 +343,41 @@ class StalledJobManager {
       this.lockDuration,
       this.maxRetries
     );
+
+    let rec = 0;
+    let events = [];
+
+    if (Array.isArray(result)) {
+      rec = Number(result[0]) || 0;
+      events = Array.isArray(result[1]) ? result[1] : [];
+    } else {
+      rec = Number(result) || 0;
+    }
+
+    for (const item of events) {
+      if (!Array.isArray(item) || item.length < 3) continue;
+      const [type, rawJob, metaRaw] = item;
+      let job;
+      try {
+        job = JSON.parse(rawJob);
+      } catch {
+        job = { raw: rawJob };
+      }
+      let meta = {};
+      try {
+        meta = JSON.parse(metaRaw);
+      } catch {}
+
+      Object.assign(job, meta);
+
+      if (type === "stalled" && typeof this.onStalled === "function") {
+        this.onStalled(job);
+      } else if (type === "dlq" && typeof this.onDLQ === "function") {
+        this.onDLQ(job, meta.failureReason || "Job stalled");
+      }
+    }
+
+    return rec;
   }
 }
 
