@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [2.0.1] - 2026-10-17
+
+### Documentation
+- Reaffirmed active project maintenance status and added production-ready badges in `README.md`.
+- Updated `CONTRIBUTING.md` guidelines to reflect an active development roadmap and welcoming contribution posture.
+
+---
+
 ## [2.0.0] - 2026-10-17
 
 ### Added
