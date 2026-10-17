@@ -25,8 +25,16 @@ This document provides a comprehensive reference for all exported classes, metho
   - [RetryableError](#retryableerror)
   - [FatalError](#fatalerror)
   - [JobTimeoutError](#jobtimeouterror)
+- [Retry Backoff Engine](#retry-backoff-engine)
+  - [Strategies](#backoff-strategies)
+  - [Jitter and Bounds](#jitter-and-bounds)
+  - [Three-Level Configuration Precedence](#three-level-configuration-precedence)
+  - [Validation and DLQ Protection](#validation-and-dlq-protection)
 - [TypeScript Types & Interfaces](#typescript-types-interfaces)
   - [Job<T>](#jobt)
+  - [BackoffStrategy](#backoffstrategy)
+  - [CustomBackoffFn<T>](#custombackofffnt)
+  - [BackoffOptions<T>](#backoffoptionst)
   - [ResilientQueueEvents<T>](#resilientqueueeventst)
   - [DLQJob<T>](#dlqjobt)
   - [DLQOptions](#dlqoptions)
@@ -69,11 +77,18 @@ Initializes a new `ResilientQueue` instance.
 
 - `options` (`QueueOptions`): Configuration options object. See [QueueOptions](#queueoptions) for all fields. Includes:
   - `jobTimeout` (`number`, optional): Default execution timeout in milliseconds for all jobs.
+  - `maxRetries` (`number`, optional): Maximum retry attempts before routing to the DLQ. Default: `3`.
+  - `baseDelay` (`number`, optional): Base retry delay in milliseconds. Default: `500`.
+  - `maxDelay` (`number`, optional): Maximum delay cap in milliseconds for exponential backoff. Default: `60000`.
+  - `backoff` (`BackoffOptions | BackoffStrategy | CustomBackoffFn`, optional): Configurable retry backoff engine settings.
+  - `strategy` (`BackoffStrategy`, optional): Backoff strategy (`"exponential"`, `"fixed"`, or `"custom"`). Default: `"exponential"`.
+  - `jitter` (`boolean`, optional): Enables Equal Jitter for exponential or ±20% jitter for fixed. Default: `false`.
 
 #### Throws
 
 - Throws an `Error` (`"redisUrl or redis options are required to initialize ResilientQueue"`) if no Redis connection configuration is provided.
 - Throws an `Error` (`"jobTimeout must be a positive number"`) if `jobTimeout` is specified and is not a positive number.
+- Throws an `Error` if backoff configuration options (`strategy`, `baseDelay`, `maxDelay`, `jitter`, `maxRetries`, `fn`) are invalid.
 
 #### Example
 
@@ -83,7 +98,12 @@ const queue = new ResilientQueue({
   maxRetries: 3,
   baseDelay: 500,
   keyPrefix: "rq",
-  jobTimeout: 5000 // default 5-second timeout
+  jobTimeout: 5000, // default 5-second timeout
+  backoff: {
+    strategy: "exponential",
+    maxDelay: 30000,
+    jitter: true
+  }
 });
 ```
 
@@ -102,6 +122,12 @@ Pushes a new job to the tail of the main queue or schedules it in the delayed so
   - `delay` (`number`, optional): Delay in milliseconds before the job becomes eligible for processing. Must be a non-negative number.
   - `runAt` (`Date | number`, optional): Exact `Date` object or Unix timestamp in milliseconds when the job should run. Mutually exclusive with `delay`.
   - `jobTimeout` (`number`, optional): Execution timeout in milliseconds for this specific job, overriding worker and queue defaults.
+  - `backoff` (`BackoffOptions | BackoffStrategy | CustomBackoffFn`, optional): Per-job retry backoff engine settings overriding worker and queue defaults.
+  - `maxRetries` (`number`, optional): Per-job maximum retry attempts.
+  - `baseDelay` (`number`, optional): Per-job base delay in milliseconds.
+  - `maxDelay` (`number`, optional): Per-job maximum delay cap in milliseconds.
+  - `strategy` (`BackoffStrategy`, optional): Per-job backoff strategy.
+  - `jitter` (`boolean`, optional): Per-job jitter flag.
 
 #### Returns
 
@@ -114,6 +140,7 @@ Pushes a new job to the tail of the main queue or schedules it in the delayed so
 - Throws an `Error` (`"runAt must be a valid Date or timestamp"`) if `runAt` is invalid.
 - Throws an `Error` (`"Cannot specify both delay and runAt"`) if both options are provided.
 - Throws an `Error` (`"jobTimeout must be a positive number"`) if `jobTimeout` is specified and is not a positive number.
+- Throws an `Error` if backoff options are invalid.
 - Throws an `Error` if the Redis destination key type does not match.
 
 #### Example
@@ -198,6 +225,13 @@ Starts worker polling and processing jobs from the queue.
 - `options` (`ProcessOptions`, optional):
   - `concurrency` (`number`, optional): Positive integer specifying how many jobs can run concurrently in this worker instance. Default: `1`.
   - `jobTimeout` (`number`, optional): Worker-level execution timeout in milliseconds, overriding the queue default.
+  - `maxRetries` (`number`, optional): Worker-level maximum retry attempts, overriding queue defaults.
+  - `baseDelay` (`number`, optional): Worker-level base delay in milliseconds, overriding queue defaults.
+  - `maxDelay` (`number`, optional): Worker-level maximum retry delay cap in milliseconds, overriding queue defaults.
+  - `strategy` (`BackoffStrategy`, optional): Worker-level backoff strategy (`"exponential" | "fixed" | "custom"`).
+  - `jitter` (`boolean`, optional): Worker-level toggle for random jitter.
+  - `fn` (`CustomBackoffFn`, optional): Worker-level custom backoff callback.
+  - `backoff` (`BackoffOptions | BackoffStrategy | CustomBackoffFn`, optional): Worker-level nested backoff configuration.
 
 #### Returns
 
@@ -208,6 +242,12 @@ Starts worker polling and processing jobs from the queue.
 - Throws an `Error` (`"A handler function must be provided to process()"`) if `handler` is not a function.
 - Throws an `Error` (`"Concurrency must be a positive integer"`) if `concurrency` is not a positive integer.
 - Throws an `Error` (`"jobTimeout must be a positive number"`) if `jobTimeout` is specified and is not a positive number.
+- Throws an `Error` (`"strategy must be one of: exponential, fixed, custom"`) if strategy is unrecognized.
+- Throws an `Error` (`"baseDelay must be a non-negative number"`) if `baseDelay` is negative or not a number.
+- Throws an `Error` (`"maxDelay must be a positive number"`) if `maxDelay` is not a positive number.
+- Throws an `Error` (`"jitter must be a boolean"`) if `jitter` is not a boolean.
+- Throws an `Error` (`"fn must be a function"`) if custom strategy `fn` is not a function.
+- Throws an `Error` (`"maxRetries must be a non-negative number"`) if `maxRetries` is invalid.
 - Throws an `Error` (`"Queue is already processing"`) if `process()` was already called on this queue instance.
 
 #### Example
@@ -218,7 +258,16 @@ queue.process(async (job) => {
   // Pass job.signal to cancel on timeout or lease loss
   const response = await fetch("https://api.example.com", { signal: job.signal });
   return await response.json();
-}, { concurrency: 4, jobTimeout: 3000 });
+}, {
+  concurrency: 4,
+  jobTimeout: 3000,
+  backoff: {
+    strategy: "exponential",
+    baseDelay: 1000,
+    maxDelay: 30000,
+    jitter: true
+  }
+});
 ```
 
 ---
@@ -538,6 +587,61 @@ new JobTimeoutError(message?: string, timeoutMs?: number | null)
 
 ---
 
+## Retry Backoff Engine
+
+`ResilientQueue` provides an enterprise-grade retry backoff engine that automatically paces retries when transient failures (`RetryableError` or `JobTimeoutError`) occur.
+
+### Backoff Strategies
+
+The engine supports three distinct backoff strategies:
+
+| Strategy | Delay Formula | Default Parameters | Description |
+| :--- | :--- | :--- | :--- |
+| `"exponential"` | `min(maxDelay, baseDelay * 2^attempt)` | `baseDelay = 500`, `maxDelay = 60000`, `jitter = false` | Standard exponential growth with doubling delay on each attempt, capped at `maxDelay`. Default strategy. |
+| `"fixed"` | Constant `baseDelay` | `baseDelay = 500`, `jitter = false` | Constant delay intervals between retries. |
+| `"custom"` | `fn(attempt, error, job) => number \| Promise<number>` | N/A (`fn` required) | Dynamic retry policies (e.g. HTTP `Retry-After` headers, rate-limit reset times). |
+
+### Jitter and Bounds
+
+To mitigate "thundering herd" spikes against downstream databases or external APIs, jitter can be enabled with `jitter: true`:
+
+- **Exponential Jitter (AWS Equal Jitter)**:
+  - Delay formula: `delay = Math.round(capped / 2 + Math.random() * (capped / 2))`
+  - Where `capped = Math.min(maxDelay, baseDelay * Math.pow(2, attempt))`.
+  - Guarantees delays are uniformly distributed within `[capped / 2, capped]`, ensuring deterministic lower bounds while diffusing concurrent retries.
+- **Fixed Jitter (±20% Jitter)**:
+  - Delay formula: `delay = Math.round(baseDelay * (0.8 + Math.random() * 0.4))`
+  - Guarantees delays are uniformly distributed within `[0.8 * baseDelay, 1.2 * baseDelay]`.
+
+When `jitter: false` (or omitted), retries are strictly deterministic to guarantee full backward compatibility for existing applications.
+
+### Three-Level Configuration Precedence
+
+Backoff configurations follow a 3-tier hierarchical resolution order:
+
+$$\text{Per-Job Configuration} \succ \text{Worker-Level Configuration} \succ \text{Queue-Level Defaults}$$
+
+1. **Per-Job (`queue.enqueue(..., { backoff: { ... } })`)**: Highest precedence. Individual parameters override worker and queue defaults.
+2. **Worker-Level (`queue.process(handler, { backoff: { ... } })`)**: Applies to all jobs executed by that specific worker instance.
+3. **Queue-Level (`new ResilientQueue({ backoff: { ... } })`)**: Global fallback defaults.
+
+#### Resolution Rules
+- Specific parameters (`strategy`, `baseDelay`, `maxDelay`, `jitter`, `fn`, `maxRetries`) are merged hierarchically across tiers.
+- A flat property (e.g. `baseDelay: 1000`) or nested property within `backoff: { baseDelay: 1000 }` can be provided interchangeably.
+- If `strategy` is omitted, it defaults to `"exponential"`.
+- If `maxDelay` is omitted, it defaults to `60000ms`.
+- If `baseDelay` is omitted, it defaults to `500ms`.
+- If `maxRetries` is omitted, it defaults to `3`.
+
+### Validation and DLQ Protection
+
+The engine includes rigorous compile-time and runtime validation to prevent invalid retry delays from corrupting the Redis delayed sorted set:
+
+- **Static Validation**: Strategies must be one of `"exponential"`, `"fixed"`, or `"custom"`. Delays must be non-negative numbers, `maxDelay` must be positive, `jitter` must be boolean, and `fn` must be a function.
+- **Runtime Custom Function Protection**: If a custom backoff callback throws an error, rejects a promise, returns `NaN`, returns a negative number, or returns a non-number, the error is safely caught and the job is immediately routed to the Dead-Letter Queue (`<keyPrefix>:dlq`) with diagnostic error metadata, emitting the `dlq` and `failed` events. It will never silently crash or schedule invalid timestamps.
+
+---
+
 ## TypeScript Types & Interfaces
 
 The package includes TypeScript definitions (`index.d.ts`).
@@ -565,6 +669,12 @@ export interface Job<T = any> {
   lockToken?: string;
   delay?: number;
   runAt?: number;
+  backoff?: BackoffOptions<T> | BackoffStrategy | CustomBackoffFn<T>;
+  maxRetries?: number;
+  baseDelay?: number;
+  maxDelay?: number;
+  strategy?: BackoffStrategy;
+  jitter?: boolean;
 }
 ```
 
@@ -587,6 +697,62 @@ export interface Job<T = any> {
 | `lockToken` | `string \| undefined` | Per-dequeue fencing token identifying this execution lease. |
 | `delay` | `number \| undefined` | Optional delay in milliseconds configured during enqueue. |
 | `runAt` | `number \| undefined` | Scheduled execution timestamp in milliseconds. |
+| `backoff` | `BackoffOptions<T> \| BackoffStrategy \| CustomBackoffFn<T> \| undefined` | Configured retry backoff options or strategy for this job. |
+| `maxRetries` | `number \| undefined` | Maximum retry attempts for this job, overriding worker and queue defaults. |
+| `baseDelay` | `number \| undefined` | Base delay in milliseconds for this job, overriding worker and queue defaults. |
+| `maxDelay` | `number \| undefined` | Maximum delay cap in milliseconds for this job, overriding worker and queue defaults. |
+| `strategy` | `BackoffStrategy \| undefined` | Backoff strategy for this job, overriding worker and queue defaults. |
+| `jitter` | `boolean \| undefined` | Jitter flag for this job, overriding worker and queue defaults. |
+
+---
+
+### `BackoffStrategy`
+
+Supported backoff strategies.
+
+```typescript
+export type BackoffStrategy = "exponential" | "fixed" | "custom";
+```
+
+---
+
+### `CustomBackoffFn<T>`
+
+Custom backoff callback signature. Receives the retry attempt number, error that caused failure, and job descriptor. Can return a delay in milliseconds synchronously or asynchronously.
+
+```typescript
+export type CustomBackoffFn<T = any> = (
+  attempt: number,
+  error: Error,
+  job: Job<T>
+) => number | Promise<number>;
+```
+
+---
+
+### `BackoffOptions<T>`
+
+Configuration options for the retry backoff engine.
+
+```typescript
+export interface BackoffOptions<T = any> {
+  strategy?: BackoffStrategy; // default: "exponential"
+  baseDelay?: number;         // default: 500
+  maxDelay?: number;          // default: 60000
+  jitter?: boolean;           // default: false
+  fn?: CustomBackoffFn<T>;
+  maxRetries?: number;        // default: 3
+}
+```
+
+| Field | Type | Default | Description |
+| :--- | :--- | :--- | :--- |
+| `strategy` | `BackoffStrategy` | `"exponential"` | Backoff strategy (`"exponential"`, `"fixed"`, or `"custom"`). |
+| `baseDelay` | `number` | `500` | Base delay in milliseconds used by backoff strategies. |
+| `maxDelay` | `number` | `60000` | Maximum retry delay cap in milliseconds for exponential backoff. |
+| `jitter` | `boolean` | `false` | Enables random jitter (AWS Equal Jitter for exponential; ±20% for fixed). |
+| `fn` | `CustomBackoffFn<T>` | `undefined` | Custom backoff callback function when strategy is `"custom"`. |
+| `maxRetries` | `number` | `3` | Maximum number of retry attempts before routing to the DLQ. |
 
 ---
 
@@ -711,6 +877,10 @@ export interface QueueOptions {
   consumer?: Redis | Cluster | RedisOptions | string;
   maxRetries?: number;      // default: 3
   baseDelay?: number;       // default: 500
+  maxDelay?: number;        // default: 60000
+  strategy?: BackoffStrategy; // default: "exponential"
+  jitter?: boolean;         // default: false
+  backoff?: BackoffOptions | BackoffStrategy | CustomBackoffFn;
   keyPrefix?: string;       // default: "rq"
   stalledInterval?: number; // default: 15000
   lockDuration?: number;    // default: 30000
@@ -730,6 +900,12 @@ export interface EnqueueOptions {
   delay?: number;
   runAt?: Date | number;
   jobTimeout?: number;
+  backoff?: BackoffOptions | BackoffStrategy | CustomBackoffFn;
+  maxRetries?: number;
+  baseDelay?: number;
+  maxDelay?: number;
+  strategy?: BackoffStrategy;
+  jitter?: boolean;
 }
 ```
 
@@ -753,6 +929,12 @@ export interface EnqueueManyItem<T = any> extends EnqueueOptions {
 export interface ProcessOptions {
   concurrency?: number; // default: 1
   jobTimeout?: number;
+  backoff?: BackoffOptions | BackoffStrategy | CustomBackoffFn;
+  maxRetries?: number;
+  baseDelay?: number;
+  maxDelay?: number;
+  strategy?: BackoffStrategy;
+  jitter?: boolean;
 }
 ```
 
