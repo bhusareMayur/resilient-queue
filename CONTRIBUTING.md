@@ -25,7 +25,7 @@ This project is actively maintained. We welcome pull requests and issues that ad
 Fork the repository on GitHub, then clone your local fork:
 
 ```bash
-git clone https://github.com/bhusareMayur/resilient-queue.git
+git clone https://github.com/resilient-queue/resilient-queue.git
 cd resilient-queue
 ```
 

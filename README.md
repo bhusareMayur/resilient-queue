@@ -1,10 +1,10 @@
 # @mayurbhusare/resilient-queue
 
 [![npm version](https://img.shields.io/npm/v/@mayurbhusare/resilient-queue?style=flat-square&color=cb3837)](https://www.npmjs.com/package/@mayurbhusare/resilient-queue)
-[![status](https://img.shields.io/badge/status-actively%20maintained-brightgreen?style=flat-square)](https://github.com/bhusareMayur/resilient-queue)
-[![production ready](https://img.shields.io/badge/production-ready-blue?style=flat-square)](https://github.com/bhusareMayur/resilient-queue)
+[![status](https://img.shields.io/badge/status-actively%20maintained-brightgreen?style=flat-square)](https://github.com/resilient-queue/resilient-queue)
+[![production ready](https://img.shields.io/badge/production-ready-blue?style=flat-square)](https://github.com/resilient-queue/resilient-queue)
 [![license](https://img.shields.io/npm/l/@mayurbhusare/resilient-queue?style=flat-square&color=blue)](./LICENSE)
-[![tests](https://img.shields.io/badge/tests-164%20passed-brightgreen?style=flat-square)](https://github.com/bhusareMayur/resilient-queue)
+[![tests](https://img.shields.io/badge/tests-164%20passed-brightgreen?style=flat-square)](https://github.com/resilient-queue/resilient-queue)
 
 A lightweight, production-grade, Redis-backed job queue for Node.js.
 
@@ -450,4 +450,4 @@ Detailed release notes and change history are maintained in [CHANGELOG.md](./CHA
 
 This project is licensed under the [MIT License](./LICENSE).
 
-Copyright (c) 2026 Mayur S. Bhusare.
+Copyright (c) 2026 Resilient Queue.
