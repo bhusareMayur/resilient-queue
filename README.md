@@ -5,19 +5,21 @@
 
 [![npm version](https://img.shields.io/npm/v/@mayurbhusare/resilient-queue?style=flat-square&color=cb3837)](https://www.npmjs.com/package/@mayurbhusare/resilient-queue)
 [![license](https://img.shields.io/npm/l/@mayurbhusare/resilient-queue?style=flat-square&color=blue)](./LICENSE)
-[![tests](https://img.shields.io/badge/tests-138%20passed-brightgreen?style=flat-square)](https://github.com/bhusareMayur/resilient-queue)
+[![tests](https://img.shields.io/badge/tests-164%20passed-brightgreen?style=flat-square)](https://github.com/bhusareMayur/resilient-queue)
 
 A lightweight, production-grade, Redis-backed job queue for Node.js.
 
-Built for resilience, **`@mayurbhusare/resilient-queue`** provides crash-durable in-flight job durability (stalled job recovery), persistent exponential backoff retries, Dead-Letter Queue (DLQ) routing, atomic enqueue-time idempotency guarantees, scheduled delayed jobs, high-throughput pipeline batch enqueuing (`enqueueMany`), in-memory worker concurrency, and graceful shutdown — with zero framework bloat and only two lean dependencies (`ioredis` and `uuid`).
+Built for resilience, **`@mayurbhusare/resilient-queue`** provides crash-durable in-flight job durability (stalled job recovery), persistent exponential backoff retries, Dead-Letter Queue (DLQ) routing, atomic enqueue-time idempotency guarantees, scheduled delayed jobs, high-throughput pipeline batch enqueuing (`enqueueMany`), real-time queue metrics (`getMetrics`), distributed pause/resume coordination (`pause`, `resume`, `isPaused`), in-memory worker concurrency, and graceful shutdown — with zero framework bloat and only two lean dependencies (`ioredis` and `uuid`).
 
 ---
 
 ## Features
 
 - **Crash-Proof Job Durability**: Uses atomic `BLMOVE` (with `BRPOPLPUSH` fallback) to move active jobs to `rq:active`. In-flight jobs are never deleted from Redis during processing. If a worker crashes, an active visibility heartbeat detects the abandoned job and safely recovers it.
+- **Real-Time Queue Metrics**: Inspect job counts across waiting, active, delayed, and dead-letter queue states (`getMetrics()`) in a single network round-trip using an `ioredis` pipeline.
+- **Distributed Pause & Resume**: Pause and resume job consumption locally and across distributed worker processes with atomic Redis coordination (`pause()`, `resume()`, `isPaused()`), active-job draining, and idempotent state transitions.
 - **Fencing Tokens & Lease Revocation**: Per-dequeue fencing tokens (`lockToken`) protect against stale workers renewing or releasing successor workers' locks. Lease loss is surfaced to handlers via `job.signal` (`AbortSignal`) and `job.isLeaseLost`.
-- **Event Emitter Observability**: Native Node.js `EventEmitter` lifecycle hooks (`completed`, `failed`, `retrying`, `dlq`, `stalled`) with safe listener isolation, duplicate prevention, and zero queue corruption.
+- **Event Emitter Observability**: Native Node.js `EventEmitter` lifecycle hooks (`completed`, `failed`, `retrying`, `dlq`, `stalled`, `paused`, `resumed`) with safe listener isolation, duplicate prevention, and zero queue corruption.
 - **Job Execution Timeouts**: Optional execution timeout (`jobTimeout`) with cooperative cancellation via `AbortSignal`, `JobTimeoutError`, automatic retry/DLQ pipeline routing, and safe lock retention.
 - **Scheduled Delayed Jobs**: Schedule jobs directly from `enqueue()` using `{ delay: ms }` or `{ runAt: new Date(...) }` backed by Redis sorted sets (`rq:delayed`) and atomic Lua promotion.
 - **High-Throughput Batch Enqueuing (`enqueueMany`)**: Enqueue thousands of jobs in a single network round-trip using an `ioredis` pipeline for 50x–100x throughput boost.
@@ -152,6 +154,16 @@ queue.on("dlq", (job, reason) => {
 // Stalled job recovered from a crashed worker
 queue.on("stalled", (job) => {
   console.warn(`[Job ${job.id}] Stalled job recovered to main queue (stalledCount: ${job.stalledCount})`);
+});
+
+// Queue consumption paused
+queue.on("paused", () => {
+  console.log("Queue consumption has been paused");
+});
+
+// Queue consumption resumed
+queue.on("resumed", () => {
+  console.log("Queue consumption has resumed");
 });
 ```
 
@@ -294,6 +306,58 @@ console.log(`Purged ${purgedCount} jobs from DLQ`);
 
 ---
 
+## Queue Metrics
+
+Inspect real-time job counts across all queue states in a single network round-trip using `getMetrics()`. Built using an `ioredis` pipeline, it fetches counts for waiting, active, delayed, and dead-letter jobs efficiently:
+
+```javascript
+// Retrieve real-time queue metrics
+const metrics = await queue.getMetrics();
+
+console.log("Queue Metrics:", metrics);
+// {
+//   waiting: 12,  // jobs waiting in rq:main
+//   active: 4,    // jobs currently being processed by workers
+//   delayed: 3,   // jobs scheduled in rq:delayed (retries and future jobs)
+//   dlq: 1        // failed jobs in rq:dlq
+// }
+```
+
+- **Pipeline Efficiency**: Uses a single `pipeline.exec()` call querying `LLEN rq:main`, `LLEN rq:active`, `ZCARD rq:delayed`, and `LLEN rq:dlq`.
+- **Numeric Validation**: Validates pipeline command results and returns strict numeric counts.
+- **Closed Queue Guard**: Throws a descriptive `Error("Queue is closed")` if called on a closed queue instance.
+
+---
+
+## Distributed Pause and Resume
+
+`ResilientQueue` provides distributed pause and resume coordination across all worker instances using a shared Redis key (`<keyPrefix>:paused`):
+
+```javascript
+// 1. Check current pause state
+const isPaused = await queue.isPaused(); // checks Redis state
+const isLocallyPaused = await queue.isPaused({ localOnly: true }); // checks in-memory flag
+
+// 2. Pause the queue across all workers
+await queue.pause();
+
+// 3. Enqueue jobs while paused (enqueue and enqueueMany remain available)
+await queue.enqueue({ task: "send-newsletter" });
+
+// 4. Resume processing across all workers
+await queue.resume();
+```
+
+### Key Pause/Resume Guarantees
+
+- **Immediate Local & Prompt Remote Response**: Calling `pause()` or `resume()` sets an in-memory flag immediately and coordinates with Redis. Remote workers detect state changes promptly and synchronize their local flags.
+- **Active Job Draining**: In-flight jobs currently being executed by workers continue processing and finish normally. No new jobs are dequeued while paused.
+- **Producer Availability**: Both `enqueue()` and `enqueueMany()` remain completely available while paused. Enqueued jobs wait safely in the main queue until resumed.
+- **Idempotency & Safe Error Handling**: Repeated calls to `pause()` or `resume()` are idempotent and do not emit duplicate events. If Redis encounters a network error, local state is safely preserved without leaving inconsistent states.
+- **Zero Resource Leaks**: All pause timers, waiters, and event listeners are cleanly terminated upon `queue.close()` or `queue.stop()`, preventing unhandled rejections or leaked timers.
+
+---
+
 ## Architecture Overview
 
 ```mermaid
@@ -343,6 +407,7 @@ All keys are namespaced by the configured `keyPrefix` (default: `"rq"`):
 | `<keyPrefix>:delayed` | `Sorted Set` | Scheduled retries waiting for backoff delay to elapse. Score is execution timestamp (ms). |
 | `<keyPrefix>:dlq` | `List` | Dead-Letter Queue storing exhausted, fatal, or poison pill failed jobs with failure metadata. |
 | `<keyPrefix>:idempotency:<key>` | `String` | Idempotency key mapping to registered candidate job ID with optional TTL expiration (`EX`). |
+| `<keyPrefix>:paused` | `String` | Shared pause flag (`"1"`) coordinating pause state across distributed workers. |
 
 ---
 
