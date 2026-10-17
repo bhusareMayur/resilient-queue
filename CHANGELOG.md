@@ -7,13 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
-## [Unreleased]
+## [2.0.0] - 2026-10-17
 
 ### Added
-- **Flexible Redis Connection Support**: Initialize `ResilientQueue` using connection URLs, standard `ioredis` options objects, existing client instances, Redis Cluster configurations, or dedicated producer/consumer connection pairs.
-- **Connection Ownership Management**: Gracefully closes queue-owned connections on `queue.close()` while preserving externally supplied client instances.
-- **Atomic Enqueue-Time Idempotency**: Deduplicate jobs via atomic Redis Lua script with optional TTL (`ttlSeconds`), returning the original job ID without pushing duplicate entries to the queue.
-- **Stalled Job Protection & Worker Crash Recovery**: Active visibility heartbeats renew job locks in `rq:locks`; a background scheduler recovers abandoned jobs from `rq:active` via atomic Lua script.
+- **Real-Time Queue Metrics**: Retrieve waiting, active, delayed, and dead-letter queue job counts in a single network round-trip via `queue.getMetrics()`.
+- **Distributed Pause & Resume**: Pause and resume job consumption locally and across distributed worker nodes with atomic Redis coordination (`pause()`, `resume()`, `isPaused()`), active-job draining, and race-safe rollback.
+- **Configurable Retry Backoff Engine**: Added configurable backoff strategies (exponential, fixed, linear), jitter algorithms (full, equal, none), configurable delay caps (`maxDelay`), and per-job dynamic backoff overrides.
+- **Lifecycle Events Observability**: Native Node.js `EventEmitter` lifecycle hooks (`completed`, `failed`, `retrying`, `dlq`, `stalled`, `paused`, `resumed`) with isolated listener safety and zero queue corruption.
+- **Job Execution Timeouts**: Configurable execution timeouts (`jobTimeout`) with cooperative cancellation via `AbortSignal`, `JobTimeoutError`, automatic retry/DLQ routing, and safe lock retention.
+- **Scheduled Delayed Jobs**: Direct job scheduling via `delay` and `runAt` backed by Redis Sorted Sets (`rq:delayed`) and atomic Lua promotion.
+- **High-Throughput Batch Enqueuing**: Pipeline-backed batch enqueuing via `queue.enqueueMany()` for 50x–100x throughput boost.
+- **Native Dead-Letter Queue (DLQ) Management**: Comprehensive DLQ inspection and remediation API (`getDLQ`, `getDLQCount`, `retryDLQJob`, `retryAllDLQ`, `removeDLQJob`, `purgeDLQ`).
+- **Flexible Redis Connection Support**: Initialize `ResilientQueue` using connection URLs, `ioredis` options objects, existing client instances, dedicated producer/consumer pairs, or Redis Cluster configurations with hash tag support.
+- **Stalled Job Protection & Worker Crash Recovery**: Active visibility heartbeats renew job locks in `rq:locks`; background scheduler recovers abandoned jobs from `rq:active` via atomic Lua script.
 - **Per-Dequeue Fencing Tokens**: Unique `lockToken` assigned per dequeue in `rq:lock_tokens` to prevent stale workers from releasing or renewing successor workers' locks.
 - **Lease Loss Detection**: Surface revoked or expired leases to handlers via `job.isLeaseLost` and `job.signal` (`AbortSignal`).
 - **External Stalled Metadata Tracking**: Store recovery metadata in `rq:stalled_meta` to keep raw JSON job payloads intact and prevent Lua `cjson` array corruption.
@@ -23,6 +29,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 - Defense-in-depth dequeue-time idempotency now checks `job.id` against registered candidate ID on initial attempt.
+- Worker concurrency now uses an in-memory worker pool with `Promise.race` backpressure over a single consumer socket.
 
 ---
 
