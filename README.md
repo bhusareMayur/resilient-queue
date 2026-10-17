@@ -5,7 +5,7 @@
 
 [![npm version](https://img.shields.io/npm/v/@mayurbhusare/resilient-queue?style=flat-square&color=cb3837)](https://www.npmjs.com/package/@mayurbhusare/resilient-queue)
 [![license](https://img.shields.io/npm/l/@mayurbhusare/resilient-queue?style=flat-square&color=blue)](./LICENSE)
-[![tests](https://img.shields.io/badge/tests-77%20passed-brightgreen?style=flat-square)](https://github.com/bhusareMayur/resilient-queue)
+[![tests](https://img.shields.io/badge/tests-138%20passed-brightgreen?style=flat-square)](https://github.com/bhusareMayur/resilient-queue)
 
 A lightweight, production-grade, Redis-backed job queue for Node.js.
 
@@ -192,6 +192,70 @@ await queue.enqueue({ orderId: 101 }, { jobTimeout: 1000 });
 - **Retry & DLQ Pipeline Integration**: `JobTimeoutError` extends `RetryableError`. Timed-out jobs are automatically retried with exponential backoff up to `maxRetries` before routing to the DLQ.
 - **Lock Safety & Race Protection**: The visibility lock in Redis is held safely until the worker handler settles, preventing another worker from executing the job concurrently due to unsafe premature lock release. Late handler resolutions and rejections are ignored safely without marking the timed-out job as completed or triggering unhandled rejections.
 - **Zero Overhead When Disabled**: When `jobTimeout` is omitted or set to `null`, timeouts are disabled and exact legacy execution semantics are preserved.
+
+---
+
+## Configurable Retry Backoff Engine
+
+`ResilientQueue` includes a robust, pluggable retry backoff engine supporting **exponential** (default), **fixed**, and **custom** backoff strategies with optional jitter and delay caps:
+
+```javascript
+const { ResilientQueue, RetryableError } = require("@mayurbhusare/resilient-queue");
+
+// 1. Exponential Backoff with Equal Jitter and delay cap
+const queue = new ResilientQueue({
+  redisUrl: "redis://127.0.0.1:6379",
+  maxRetries: 5,
+  backoff: {
+    strategy: "exponential", // default
+    baseDelay: 500,          // baseDelay * 2^attempt (1s, 2s, 4s...)
+    maxDelay: 30000,         // cap at 30 seconds (default: 60000ms)
+    jitter: true             // AWS Equal Jitter: [capped / 2, capped]
+  }
+});
+
+// 2. Fixed Backoff Strategy with ±20% jitter
+queue.process(async (job) => {
+  throw new RetryableError("Rate limit reached");
+}, {
+  backoff: {
+    strategy: "fixed",
+    baseDelay: 2000, // constant 2000ms delay
+    jitter: true     // ±20% jitter: [1600ms, 2400ms]
+  }
+});
+
+// 3. Custom Dynamic Strategy (e.g., HTTP Retry-After headers)
+await queue.enqueue({ endpoint: "/api/sync" }, {
+  backoff: {
+    strategy: "custom",
+    fn: (attempt, error, job) => {
+      // Inspect caught error or job data dynamically
+      if (error.response?.headers?.["retry-after"]) {
+        return parseInt(error.response.headers["retry-after"], 10) * 1000;
+      }
+      return Math.min(60000, attempt * 1000);
+    }
+  }
+});
+```
+
+### Backoff Strategies
+
+| Strategy | Formula | Jitter Behavior | Default Parameters |
+| :--- | :--- | :--- | :--- |
+| **`exponential`** (default) | `min(maxDelay, baseDelay * 2^attempt)` | Optional AWS Equal Jitter: `[capped / 2, capped]` | `baseDelay: 500ms`, `maxDelay: 60000ms`, `jitter: false` |
+| **`fixed`** | Constant `baseDelay` | Optional ±20% random variation: `[baseDelay * 0.8, baseDelay * 1.2]` | `baseDelay: 500ms`, `jitter: false` |
+| **`custom`** | `fn(attempt, error, job) => number \| Promise<number>` | Dynamic / determined by user callback | Required `fn` callback |
+
+### Three-Level Configuration Precedence
+
+Backoff configuration follows hierarchical resolution matching the `jobTimeout` pattern:
+$$\text{Per-Job Enqueue Options} > \text{Worker-Level Process Options} > \text{Queue-Level Defaults}$$
+
+- Individual options (`strategy`, `baseDelay`, `maxDelay`, `jitter`, `fn`, `maxRetries`) merge hierarchically, allowing granular overrides at each tier.
+- **Legacy Backward Compatibility**: Existing `baseDelay` and `maxRetries` constructor and enqueue options are 100% backward compatible and retain deterministic timing unless jitter is explicitly enabled.
+- **Fail-Safe Validation & DLQ Protection**: All configuration options and computed delays are validated strictly. If a custom callback throws or returns an invalid value (`NaN`, negative, non-number), the error is handled safely and the job is routed to the Dead-Letter Queue (DLQ) without silently scheduling invalid or infinite delays.
 
 ---
 

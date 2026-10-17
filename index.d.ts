@@ -89,6 +89,36 @@ export interface Job<T = any> {
    * Boolean flag indicating whether this job execution exceeded its configured execution timeout.
    */
   isTimedOut?: boolean;
+
+  /**
+   * Configured retry backoff options or strategy for this job.
+   */
+  backoff?: BackoffOptions<T> | BackoffStrategy | CustomBackoffFn<T>;
+
+  /**
+   * Maximum retry attempts for this job, overriding worker and queue defaults.
+   */
+  maxRetries?: number;
+
+  /**
+   * Base delay in milliseconds for this job, overriding worker and queue defaults.
+   */
+  baseDelay?: number;
+
+  /**
+   * Maximum delay cap in milliseconds for this job, overriding worker and queue defaults.
+   */
+  maxDelay?: number;
+
+  /**
+   * Backoff strategy for this job, overriding worker and queue defaults.
+   */
+  strategy?: BackoffStrategy;
+
+  /**
+   * Jitter flag for this job, overriding worker and queue defaults.
+   */
+  jitter?: boolean;
 }
 
 /**
@@ -105,6 +135,64 @@ export interface RedisConnectionPair {
 export interface ClusterConfig {
   nodes: ClusterNode[];
   options?: ClusterOptions;
+}
+
+/**
+ * Supported backoff strategies.
+ */
+export type BackoffStrategy = "exponential" | "fixed" | "custom";
+
+/**
+ * Custom backoff callback signature.
+ * Receives the attempt number, error that caused failure, and job descriptor.
+ * Can return a delay in milliseconds synchronously or asynchronously.
+ */
+export type CustomBackoffFn<T = any> = (
+  attempt: number,
+  error: Error,
+  job: Job<T>
+) => number | Promise<number>;
+
+/**
+ * Options configuring the retry backoff engine.
+ */
+export interface BackoffOptions<T = any> {
+  /**
+   * Backoff strategy: "exponential" (default), "fixed", or "custom".
+   * @default "exponential"
+   */
+  strategy?: BackoffStrategy;
+
+  /**
+   * Base delay in milliseconds used by backoff strategies.
+   * @default 500
+   */
+  baseDelay?: number;
+
+  /**
+   * Maximum retry delay cap in milliseconds for exponential backoff.
+   * @default 60000
+   */
+  maxDelay?: number;
+
+  /**
+   * Enables random jitter to avoid thundering herds.
+   * For exponential: AWS Equal Jitter [capped/2, capped].
+   * For fixed: ±20% jitter [baseDelay * 0.8, baseDelay * 1.2].
+   * @default false
+   */
+  jitter?: boolean;
+
+  /**
+   * Custom backoff callback when strategy is "custom".
+   */
+  fn?: CustomBackoffFn<T>;
+
+  /**
+   * Maximum number of retry attempts before routing to the DLQ.
+   * @default 3
+   */
+  maxRetries?: number;
 }
 
 /**
@@ -176,6 +264,29 @@ export interface QueueOptions {
   baseDelay?: number;
 
   /**
+   * Maximum retry delay cap in milliseconds for exponential backoff.
+   * @default 60000
+   */
+  maxDelay?: number;
+
+  /**
+   * Retry backoff strategy: "exponential" (default), "fixed", or "custom".
+   * @default "exponential"
+   */
+  strategy?: BackoffStrategy;
+
+  /**
+   * Enable random jitter for retry backoff delays.
+   * @default false
+   */
+  jitter?: boolean;
+
+  /**
+   * Configurable retry backoff engine options, strategy name, or custom function.
+   */
+  backoff?: BackoffOptions | BackoffStrategy | CustomBackoffFn;
+
+  /**
    * Key namespace prefix for Redis keys (e.g. "rq" produces "rq:main", "rq:delayed", etc.).
    *
    * @remarks
@@ -238,6 +349,36 @@ export interface EnqueueOptions {
    * Optional execution timeout in milliseconds for this specific job, overriding worker and queue defaults.
    */
   jobTimeout?: number;
+
+  /**
+   * Configurable retry backoff engine options, strategy name, or custom function for this job.
+   */
+  backoff?: BackoffOptions | BackoffStrategy | CustomBackoffFn;
+
+  /**
+   * Per-job maximum retry attempts overriding worker and queue defaults.
+   */
+  maxRetries?: number;
+
+  /**
+   * Per-job base delay in milliseconds overriding worker and queue defaults.
+   */
+  baseDelay?: number;
+
+  /**
+   * Per-job maximum delay cap in milliseconds overriding worker and queue defaults.
+   */
+  maxDelay?: number;
+
+  /**
+   * Per-job backoff strategy overriding worker and queue defaults.
+   */
+  strategy?: BackoffStrategy;
+
+  /**
+   * Per-job jitter flag overriding worker and queue defaults.
+   */
+  jitter?: boolean;
 }
 
 /**
@@ -274,6 +415,36 @@ export interface ProcessOptions {
    * Optional worker-level execution timeout in milliseconds, overriding the queue default.
    */
   jobTimeout?: number;
+
+  /**
+   * Configurable retry backoff engine options, strategy name, or custom function for this worker.
+   */
+  backoff?: BackoffOptions | BackoffStrategy | CustomBackoffFn;
+
+  /**
+   * Worker-level maximum retry attempts overriding the queue default.
+   */
+  maxRetries?: number;
+
+  /**
+   * Worker-level base delay in milliseconds overriding the queue default.
+   */
+  baseDelay?: number;
+
+  /**
+   * Worker-level maximum delay cap in milliseconds overriding the queue default.
+   */
+  maxDelay?: number;
+
+  /**
+   * Worker-level backoff strategy overriding the queue default.
+   */
+  strategy?: BackoffStrategy;
+
+  /**
+   * Worker-level jitter flag overriding the queue default.
+   */
+  jitter?: boolean;
 }
 
 /**

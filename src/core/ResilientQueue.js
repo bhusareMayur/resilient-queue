@@ -25,8 +25,13 @@ class ResilientQueue extends EventEmitter {
       connection,
       producer,
       consumer,
-      maxRetries = 3,
-      baseDelay = 500,
+      maxRetries,
+      baseDelay,
+      maxDelay,
+      backoff,
+      strategy,
+      jitter,
+      fn,
       keyPrefix = "rq",
       stalledInterval = 15000,
       lockDuration = 30000,
@@ -56,7 +61,37 @@ class ResilientQueue extends EventEmitter {
       }
     }
 
+    RetryManager.validateBackoffOptions({
+      maxRetries,
+      baseDelay,
+      maxDelay,
+      jitter,
+      strategy,
+      backoff,
+      fn
+    });
+
+    const resolvedBaseDelay =
+      baseDelay ??
+      (typeof backoff === "object" && backoff !== null ? backoff.baseDelay : undefined) ??
+      500;
+    const resolvedMaxRetries =
+      maxRetries ??
+      (typeof backoff === "object" && backoff !== null ? backoff.maxRetries : undefined) ??
+      3;
+    const resolvedMaxDelay =
+      maxDelay ??
+      (typeof backoff === "object" && backoff !== null ? backoff.maxDelay : undefined) ??
+      60000;
+
     this.jobTimeout = jobTimeout || null;
+    this.maxRetries = resolvedMaxRetries;
+    this.baseDelay = resolvedBaseDelay;
+    this.maxDelay = resolvedMaxDelay;
+    this.backoff = backoff;
+    this.strategy = strategy;
+    this.jitter = jitter;
+    this.customJobBackoffFns = new Map();
     this.lockDuration = lockDuration;
     this.keyPrefix = keyPrefix;
     this.mainQueueKey = `${keyPrefix}:main`;
@@ -86,7 +121,12 @@ class ResilientQueue extends EventEmitter {
       this.producer,
       keyPrefix,
       {
-        onDLQ: (job, reason) => this._safeEmit("dlq", job, reason)
+        onDLQ: (job, reason) => {
+          if (job && job.id) {
+            this.customJobBackoffFns.delete(job.id);
+          }
+          this._safeEmit("dlq", job, reason);
+        }
       }
     );
 
@@ -94,8 +134,13 @@ class ResilientQueue extends EventEmitter {
       this.producer,
       this.dlqManager,
       {
-        maxRetries,
-        baseDelay,
+        maxRetries: resolvedMaxRetries,
+        baseDelay: resolvedBaseDelay,
+        maxDelay: resolvedMaxDelay,
+        backoff: options.backoff,
+        strategy: options.strategy,
+        jitter: options.jitter,
+        fn: options.fn,
         keyPrefix,
         onRetrying: (job, error, attempt, delayMs) =>
           this._safeEmit("retrying", job, error, attempt, delayMs)
@@ -109,7 +154,7 @@ class ResilientQueue extends EventEmitter {
         stalledInterval,
         lockDuration,
         maxStalledCount,
-        maxRetries,
+        maxRetries: resolvedMaxRetries,
         onStalled: (job) => this._safeEmit("stalled", job),
         onDLQ: (job, reason) => this._safeEmit("dlq", job, reason)
       }
@@ -148,7 +193,20 @@ class ResilientQueue extends EventEmitter {
    * Validates options and creates the job descriptor.
    */
   _prepareJob(data, options = {}) {
-    const { idempotencyKey, ttlSeconds, delay, runAt, jobTimeout } = options || {};
+    const {
+      idempotencyKey,
+      ttlSeconds,
+      delay,
+      runAt,
+      jobTimeout,
+      maxRetries,
+      baseDelay,
+      maxDelay,
+      strategy,
+      jitter,
+      backoff,
+      fn
+    } = options || {};
 
     if (ttlSeconds !== undefined && ttlSeconds !== null) {
       if (typeof ttlSeconds !== "number" || !Number.isInteger(ttlSeconds)) {
@@ -161,6 +219,16 @@ class ResilientQueue extends EventEmitter {
         throw new Error("jobTimeout must be a positive number");
       }
     }
+
+    RetryManager.validateBackoffOptions({
+      maxRetries,
+      baseDelay,
+      maxDelay,
+      strategy,
+      jitter,
+      backoff,
+      fn
+    });
 
     let isDelayed = false;
     let executeAt = null;
@@ -204,6 +272,45 @@ class ResilientQueue extends EventEmitter {
 
     if (jobTimeout !== undefined && jobTimeout !== null) {
       job.jobTimeout = jobTimeout;
+    }
+
+    if (maxRetries !== undefined && maxRetries !== null) {
+      job.maxRetries = maxRetries;
+    }
+
+    if (baseDelay !== undefined && baseDelay !== null) {
+      job.baseDelay = baseDelay;
+    }
+
+    if (maxDelay !== undefined && maxDelay !== null) {
+      job.maxDelay = maxDelay;
+    }
+
+    if (strategy !== undefined && strategy !== null) {
+      job.strategy = strategy;
+    }
+
+    if (jitter !== undefined && jitter !== null) {
+      job.jitter = jitter;
+    }
+
+    if (backoff !== undefined && backoff !== null) {
+      if (typeof backoff === "function") {
+        job.backoff = { strategy: "custom" };
+        this.customJobBackoffFns.set(job.id, backoff);
+      } else if (typeof backoff === "string") {
+        job.backoff = { strategy: backoff };
+      } else if (typeof backoff === "object") {
+        const { fn: customFn, ...serializableBackoff } = backoff;
+        job.backoff = { ...serializableBackoff };
+        if (typeof customFn === "function") {
+          this.customJobBackoffFns.set(job.id, customFn);
+        }
+      }
+    }
+
+    if (typeof fn === "function") {
+      this.customJobBackoffFns.set(job.id, fn);
     }
 
     if (delay !== undefined && delay !== null) {
@@ -387,6 +494,8 @@ class ResilientQueue extends EventEmitter {
       }
     }
 
+    RetryManager.validateBackoffOptions(options);
+
     if (this.isRunning) {
       throw new Error("Queue is already processing");
     }
@@ -469,6 +578,10 @@ class ResilientQueue extends EventEmitter {
     this.stalledScheduler = setTimeout(promoteStalled, 0);
 
     const executeJob = async (job, abortController) => {
+      if (this.customJobBackoffFns.has(job.id)) {
+        job._customBackoffFn = this.customJobBackoffFns.get(job.id);
+      }
+
       let shouldProceed = true;
 
       // Apply idempotency only on the first attempt if it hasn't stalled.
@@ -499,13 +612,14 @@ class ResilientQueue extends EventEmitter {
           const result = await handler(job);
           if (!job.isLeaseLost && !completedEmitted) {
             completedEmitted = true;
+            this.customJobBackoffFns.delete(job.id);
             this._safeEmit("completed", job, result);
           }
         } catch (error) {
           if (!job.isLeaseLost && !failedEmitted) {
             failedEmitted = true;
             this._safeEmit("failed", job, error);
-            await this.retryManager.handleFailure(job, error);
+            await this.retryManager.handleFailure(job, error, options);
           }
         }
         return;
@@ -544,6 +658,7 @@ class ResilientQueue extends EventEmitter {
         const result = await Promise.race([handlerPromise, timeoutPromise]);
         if (!job.isLeaseLost && !timedOut && !completedEmitted) {
           completedEmitted = true;
+          this.customJobBackoffFns.delete(job.id);
           this._safeEmit("completed", job, result);
         }
       } catch (error) {
@@ -564,7 +679,7 @@ class ResilientQueue extends EventEmitter {
         }
 
         if (!job.isLeaseLost) {
-          await this.retryManager.handleFailure(job, error);
+          await this.retryManager.handleFailure(job, error, options);
         }
       } finally {
         if (timeoutTimer) {
@@ -733,6 +848,9 @@ class ResilientQueue extends EventEmitter {
         await Promise.all(this.workers);
       }
     } finally {
+      if (this.customJobBackoffFns) {
+        this.customJobBackoffFns.clear();
+      }
       await this.redisClientWrapper.disconnect();
     }
   }

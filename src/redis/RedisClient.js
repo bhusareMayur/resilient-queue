@@ -172,7 +172,12 @@ function resolveConfig(input) {
     "stalledInterval",
     "lockDuration",
     "maxStalledCount",
-    "jobTimeout"
+    "jobTimeout",
+    "backoff",
+    "maxDelay",
+    "strategy",
+    "jitter",
+    "fn"
   ];
   const keys = Object.keys(input);
   const onlyQueueKeys = keys.length > 0 && keys.every(k => queueKeys.includes(k));
