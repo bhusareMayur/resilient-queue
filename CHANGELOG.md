@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [2.0.2] - 2026-10-17
+
+### Changed
+- Migrated repository URLs, bug tracker, and homepage to the official `resilient-queue` GitHub organization.
+- Updated license and documentation copyright attribution to `Resilient Queue`.
+- Updated contributing guidelines and security advisory links.
+
+---
+
 ## [2.0.1] - 2026-10-17
 
 ### Documentation
