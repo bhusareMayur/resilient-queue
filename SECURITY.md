@@ -17,7 +17,7 @@ If you discover a security vulnerability in `@mayurbhusare/resilient-queue`, ple
 
 ### How to Report
 
-1. **GitHub Security Advisory**: Submit a private vulnerability report via GitHub at [https://github.com/bhusareMayur/resilient-queue/security/advisories/new](https://github.com/bhusareMayur/resilient-queue/security/advisories/new).
+1. **GitHub Security Advisory**: Submit a private vulnerability report via GitHub at [https://github.com/resilient-queue/resilient-queue/security/advisories/new](https://github.com/resilient-queue/resilient-queue/security/advisories/new).
 2. **Direct Contact**: If GitHub Security Advisories are unavailable, contact the maintainer directly via GitHub or email at `bhusaremayur@gmail.com`.
 
 ### Information to Include

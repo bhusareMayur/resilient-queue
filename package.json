@@ -21,12 +21,12 @@
   "author": "Mayur S. Bhusare",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/bhusareMayur/resilient-queue.git"
+    "url": "git+https://github.com/resilient-queue/resilient-queue.git"
   },
   "bugs": {
-    "url": "https://github.com/bhusareMayur/resilient-queue/issues"
+    "url": "https://github.com/resilient-queue/resilient-queue/issues"
   },
-  "homepage": "https://github.com/bhusareMayur/resilient-queue#readme",
+  "homepage": "https://github.com/resilient-queue/resilient-queue#readme",
   "publishConfig": {
     "access": "public"
   },
