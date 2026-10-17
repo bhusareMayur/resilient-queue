@@ -20,6 +20,10 @@ This document provides a comprehensive reference for all exported classes, metho
   - [queue.retryAllDLQ([options])](#queueretryalldlqoptions)
   - [queue.removeDLQJob(jobId)](#queueremovedlqjobjobid)
   - [queue.purgeDLQ()](#queuepurgedlq)
+  - [queue.getMetrics()](#queuegetmetrics)
+  - [queue.pause()](#queuepause)
+  - [queue.resume()](#queueresume)
+  - [queue.isPaused([options])](#queueispausedoptions)
   - [Lifecycle Events](#lifecycle-events)
 - [Error Classes](#error-classes)
   - [RetryableError](#retryableerror)
@@ -36,6 +40,7 @@ This document provides a comprehensive reference for all exported classes, metho
   - [CustomBackoffFn<T>](#custombackofffnt)
   - [BackoffOptions<T>](#backoffoptionst)
   - [ResilientQueueEvents<T>](#resilientqueueeventst)
+  - [QueueMetrics](#queuemetrics)
   - [DLQJob<T>](#dlqjobt)
   - [DLQOptions](#dlqoptions)
   - [DLQResult<T>](#dlqresultt)
@@ -466,6 +471,100 @@ console.log(`Purged ${purged} failed jobs from DLQ`);
 
 ---
 
+### `queue.getMetrics()`
+
+Retrieves real-time counts across waiting, active, delayed, and dead-letter states in a single network round-trip using an `ioredis` pipeline.
+
+#### Returns
+
+- `Promise<QueueMetrics>`: Resolves to an object containing numeric counts:
+  - `waiting` (`number`): Number of jobs waiting in the main FIFO queue (`<keyPrefix>:main`).
+  - `active` (`number`): Number of in-flight jobs currently being processed by workers (`<keyPrefix>:active`).
+  - `delayed` (`number`): Number of scheduled jobs and pending retries in the delayed sorted set (`<keyPrefix>:delayed`).
+  - `dlq` (`number`): Number of failed jobs stored in the Dead-Letter Queue (`<keyPrefix>:dlq`).
+
+#### Throws
+
+- Throws an `Error` (`"Queue is closed"`) if called on a closed queue instance.
+- Throws an `Error` if the pipeline execution fails or returns command errors.
+
+#### Example
+
+```javascript
+const metrics = await queue.getMetrics();
+console.log(`Waiting: ${metrics.waiting}, Active: ${metrics.active}, Delayed: ${metrics.delayed}, DLQ: ${metrics.dlq}`);
+```
+
+---
+
+### `queue.pause()`
+
+Pauses queue job consumption. In-flight active jobs continue executing until finished, but no new jobs are dequeued. The pause state is shared across all workers via Redis key `<keyPrefix>:paused`. Enqueuing remains fully functional while paused.
+
+#### Returns
+
+- `Promise<void>`: Resolves when local state is updated and the Redis pause key is set.
+
+#### Throws
+
+- Throws an `Error` (`"Queue is closed"`) if called on a closed queue instance.
+- Throws an `Error` if Redis operations fail.
+
+#### Example
+
+```javascript
+await queue.pause();
+console.log("Queue paused across all worker instances");
+```
+
+---
+
+### `queue.resume()`
+
+Resumes queue job consumption. Dequeuing resumes promptly on the local worker and across distributed workers. Idempotent and coordinates via Redis key `<keyPrefix>:paused`.
+
+#### Returns
+
+- `Promise<void>`: Resolves when local state is updated and the Redis pause key is removed.
+
+#### Throws
+
+- Throws an `Error` (`"Queue is closed"`) if called on a closed queue instance.
+- Throws an `Error` if Redis operations fail.
+
+#### Example
+
+```javascript
+await queue.resume();
+console.log("Queue processing resumed");
+```
+
+---
+
+### `queue.isPaused([options])`
+
+Returns whether the queue is currently paused. By default, queries the shared Redis key `<keyPrefix>:paused` for distributed coordination with safe fallback to in-memory state on Redis errors.
+
+#### Parameters
+
+- `options` (`{ localOnly?: boolean } | boolean`, optional): If `true` or `{ localOnly: true }`, inspects the in-memory flag without a Redis command round-trip.
+
+#### Returns
+
+- `Promise<boolean>`: Resolves to `true` if paused, `false` otherwise.
+
+#### Example
+
+```javascript
+// Distributed check (queries Redis)
+const paused = await queue.isPaused();
+
+// Fast local in-memory check
+const localPaused = await queue.isPaused({ localOnly: true });
+```
+
+---
+
 ## Lifecycle Events
 
 `ResilientQueue` extends Node.js's native `EventEmitter`. All event listeners execute inside an isolated boundary; errors thrown synchronously or rejected asynchronously by listener functions do not corrupt queue state, interrupt job processing, or trigger unhandled rejections.
@@ -515,6 +614,16 @@ console.log(`Purged ${purged} failed jobs from DLQ`);
 
 - **Signature**: `(error: Error) => void`
 - **Description**: Emitted when an event listener throws a synchronous error or returns a rejected promise, if an `'error'` listener is registered.
+
+### Event: `'paused'`
+
+- **Signature**: `() => void`
+- **Description**: Emitted when queue consumption is paused.
+
+### Event: `'resumed'`
+
+- **Signature**: `() => void`
+- **Description**: Emitted when queue consumption is resumed.
 
 ---
 
@@ -768,6 +877,8 @@ export interface ResilientQueueEvents<T = any> {
   dlq: (job: DLQJob<T> | Job<T>, reason: Error | string) => void;
   stalled: (job: Job<T>) => void;
   error: (error: Error) => void;
+  paused: () => void;
+  resumed: () => void;
 }
 ```
 
@@ -779,6 +890,30 @@ export interface ResilientQueueEvents<T = any> {
 | `dlq` | `(job: DLQJob<T> \| Job<T>, reason: Error \| string) => void` | Emitted when a job is permanently moved to the Dead-Letter Queue. |
 | `stalled` | `(job: Job<T>) => void` | Emitted when an abandoned stalled job is recovered to the main queue. |
 | `error` | `(error: Error) => void` | Emitted when an internal error occurs or a listener throws. |
+| `paused` | `() => void` | Emitted when queue job consumption is paused. |
+| `resumed` | `() => void` | Emitted when queue job consumption is resumed. |
+
+---
+
+### `QueueMetrics`
+
+Real-time metric counts returned by `queue.getMetrics()`.
+
+```typescript
+export interface QueueMetrics {
+  waiting: number;
+  active: number;
+  delayed: number;
+  dlq: number;
+}
+```
+
+| Field | Type | Description |
+| :--- | :--- | :--- |
+| `waiting` | `number` | Number of pending jobs waiting in the main FIFO queue (`<keyPrefix>:main`). |
+| `active` | `number` | Number of in-flight jobs currently being processed by workers (`<keyPrefix>:active`). |
+| `delayed` | `number` | Number of scheduled jobs and pending retries in the delayed sorted set (`<keyPrefix>:delayed`). |
+| `dlq` | `number` | Number of failed jobs stored in the Dead-Letter Queue (`<keyPrefix>:dlq`). |
 
 ---
 
@@ -984,3 +1119,4 @@ All Redis keys are namespaced with the configured `keyPrefix` (default: `"rq"`):
 | `<keyPrefix>:delayed` | `Sorted Set` | Scheduled retries. Member: serialized retry job, Score: execution timestamp (ms). |
 | `<keyPrefix>:dlq` | `List` | Dead-Letter Queue storing permanently failed jobs with diagnostics. |
 | `<keyPrefix>:idempotency:<key>` | `String` | Idempotency key mapping to registered job ID with optional TTL. |
+| `<keyPrefix>:paused` | `String` | Shared pause flag (`"1"`) coordinating pause state across distributed workers. |

@@ -96,6 +96,17 @@ class ResilientQueue extends EventEmitter {
     this.keyPrefix = keyPrefix;
     this.mainQueueKey = `${keyPrefix}:main`;
     this.delayedQueueKey = `${keyPrefix}:delayed`;
+    this.activeQueueKey = `${keyPrefix}:active`;
+    this.dlqKey = `${keyPrefix}:dlq`;
+    this.pausedKey = `${keyPrefix}:paused`;
+    this._isLocallyPaused = false;
+    this._resumeWaiters = new Set();
+    this._pausePollInterval =
+      typeof options.pausePollInterval === "number" &&
+      Number.isFinite(options.pausePollInterval) &&
+      options.pausePollInterval > 0
+        ? options.pausePollInterval
+        : 50;
     this.isRunning = false;
     this.isClosed = false;
     this.workerCount = 0;
@@ -699,6 +710,11 @@ class ResilientQueue extends EventEmitter {
           continue;
         }
 
+        if (await this.isPaused()) {
+          await this._waitForResume();
+          continue;
+        }
+
         try {
           // Timeout = 1 second for graceful shutdown.
           // Atomically moves job from rq:main to rq:active
@@ -708,6 +724,29 @@ class ResilientQueue extends EventEmitter {
           );
 
           if (!rawJob) {
+            continue;
+          }
+
+          if (await this.isPaused()) {
+            try {
+              await this.producer.eval(
+                `
+                local removed = redis.call('LREM', KEYS[1], 1, ARGV[1])
+                if removed > 0 then
+                  redis.call('LPUSH', KEYS[2], ARGV[1])
+                  return 1
+                end
+                return 0
+                `,
+                2,
+                this.activeQueueKey,
+                this.mainQueueKey,
+                rawJob
+              );
+            } catch (err) {
+              this._safeEmit("error", err);
+            }
+            await this._waitForResume();
             continue;
           }
 
@@ -797,6 +836,7 @@ class ResilientQueue extends EventEmitter {
    */
   async stop() {
     this.isRunning = false;
+    this._wakeResumeWaiters();
 
     if (this.retryScheduler) {
       clearTimeout(this.retryScheduler);
@@ -842,6 +882,7 @@ class ResilientQueue extends EventEmitter {
     this.isClosed = true;
 
     await this.stop();
+    this._cleanupPauseState();
 
     try {
       if (this.workers && this.workers.length > 0) {
@@ -909,6 +950,186 @@ class ResilientQueue extends EventEmitter {
    */
   async promoteDelayedJobs() {
     return await this.retryManager.promoteDueRetries();
+  }
+
+  /**
+   * Waits until the queue is resumed or shut down.
+   */
+  _waitForResume() {
+    if (!this.isRunning || this.isClosed) {
+      return Promise.resolve();
+    }
+
+    return new Promise((resolve) => {
+      let timer = null;
+
+      const cleanupAndResolve = () => {
+        if (timer) {
+          clearTimeout(timer);
+          timer = null;
+        }
+        this._resumeWaiters.delete(cleanupAndResolve);
+        resolve();
+      };
+
+      this._resumeWaiters.add(cleanupAndResolve);
+
+      timer = setTimeout(() => {
+        cleanupAndResolve();
+      }, this._pausePollInterval);
+
+      if (timer && timer.unref) {
+        timer.unref();
+      }
+    });
+  }
+
+  /**
+   * Wakes up any pending resume waiters.
+   */
+  _wakeResumeWaiters() {
+    if (this._resumeWaiters && this._resumeWaiters.size > 0) {
+      const waiters = Array.from(this._resumeWaiters);
+      this._resumeWaiters.clear();
+      for (const waiter of waiters) {
+        try {
+          waiter();
+        } catch {
+          // Safety net
+        }
+      }
+    }
+  }
+
+  /**
+   * Cleans up pause waiters and state on close.
+   */
+  _cleanupPauseState() {
+    this._wakeResumeWaiters();
+    this._isLocallyPaused = false;
+  }
+
+  /**
+   * Returns real-time metrics for waiting, active, delayed, and dead-letter queue jobs.
+   * Uses an ioredis pipeline to query all four states in a single network round-trip.
+   *
+   * @returns {Promise<{ waiting: number, active: number, delayed: number, dlq: number }>}
+   */
+  async getMetrics() {
+    if (this.isClosed) {
+      throw new Error("Queue is closed");
+    }
+
+    const pipeline = this.producer.pipeline();
+    pipeline.llen(this.mainQueueKey);
+    pipeline.llen(this.activeQueueKey);
+    pipeline.zcard(this.delayedQueueKey);
+    pipeline.llen(this.dlqKey);
+
+    const results = await pipeline.exec();
+
+    if (!results) {
+      throw new Error("Pipeline execution failed: no results returned");
+    }
+
+    for (let i = 0; i < results.length; i++) {
+      const [err] = results[i];
+      if (err) {
+        throw err;
+      }
+    }
+
+    return {
+      waiting: Number(results[0][1]) || 0,
+      active: Number(results[1][1]) || 0,
+      delayed: Number(results[2][1]) || 0,
+      dlq: Number(results[3][1]) || 0
+    };
+  }
+
+  /**
+   * Pauses queue job consumption.
+   * Active jobs continue executing until finished, but no new jobs are dequeued.
+   * Idempotent and coordinates across distributed workers using Redis.
+   */
+  async pause() {
+    if (this.isClosed) {
+      throw new Error("Queue is closed");
+    }
+
+    const wasPaused = this._isLocallyPaused;
+    this._isLocallyPaused = true;
+
+    try {
+      await this.producer.set(this.pausedKey, "1");
+      if (!wasPaused) {
+        this._safeEmit("paused");
+      }
+    } catch (err) {
+      this._isLocallyPaused = wasPaused;
+      throw err;
+    }
+  }
+
+  /**
+   * Resumes queue job consumption.
+   * Dequeuing resumes promptly locally and across distributed workers.
+   * Idempotent and coordinates across distributed workers using Redis.
+   */
+  async resume() {
+    if (this.isClosed) {
+      throw new Error("Queue is closed");
+    }
+
+    const wasPaused = this._isLocallyPaused;
+    this._isLocallyPaused = false;
+
+    try {
+      const deleted = await this.producer.del(this.pausedKey);
+      this._wakeResumeWaiters();
+      if (wasPaused || deleted > 0) {
+        this._safeEmit("resumed");
+      }
+    } catch (err) {
+      this._isLocallyPaused = wasPaused;
+      throw err;
+    }
+  }
+
+  /**
+   * Returns whether the queue is currently paused.
+   * Checks Redis state by default for distributed coordination,
+   * with fallback to local state if Redis errors.
+   *
+   * @param {object|boolean} [options] Optional options or boolean localOnly flag.
+   * @returns {Promise<boolean>}
+   */
+  async isPaused(options = {}) {
+    const localOnly =
+      typeof options === "boolean" ? options : Boolean(options && options.localOnly);
+
+    if (localOnly || this.isClosed) {
+      return this._isLocallyPaused;
+    }
+
+    try {
+      const val = await this.producer.get(this.pausedKey);
+      const redisPaused = val !== null && val !== undefined && val !== "0";
+
+      if (this._isLocallyPaused !== redisPaused) {
+        this._isLocallyPaused = redisPaused;
+        if (redisPaused) {
+          this._safeEmit("paused");
+        } else {
+          this._wakeResumeWaiters();
+          this._safeEmit("resumed");
+        }
+      }
+
+      return redisPaused;
+    } catch (err) {
+      return this._isLocallyPaused;
+    }
   }
 }
 

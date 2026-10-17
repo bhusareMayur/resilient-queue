@@ -319,6 +319,37 @@ export interface QueueOptions {
    * Default execution timeout in milliseconds for jobs processed by this queue.
    */
   jobTimeout?: number;
+
+  /**
+   * Polling interval in milliseconds used by paused workers to coordinate across Redis instances.
+   * @default 50
+   */
+  pausePollInterval?: number;
+}
+
+/**
+ * Real-time queue metrics representing job counts across states.
+ */
+export interface QueueMetrics {
+  /**
+   * Number of jobs waiting in the main queue to be processed.
+   */
+  waiting: number;
+
+  /**
+   * Number of jobs currently being processed by workers.
+   */
+  active: number;
+
+  /**
+   * Number of delayed or retrying jobs scheduled for future execution.
+   */
+  delayed: number;
+
+  /**
+   * Number of failed jobs stored in the Dead-Letter Queue (DLQ).
+   */
+  dlq: number;
 }
 
 /**
@@ -571,6 +602,16 @@ export interface ResilientQueueEvents<T = any> {
    * Emitted when an error is encountered in an event listener.
    */
   error: (error: Error) => void;
+
+  /**
+   * Emitted when queue consumption is paused.
+   */
+  paused: () => void;
+
+  /**
+   * Emitted when queue consumption is resumed.
+   */
+  resumed: () => void;
 }
 
 /**
@@ -712,6 +753,33 @@ export class ResilientQueue extends EventEmitter {
    * @returns Number of jobs promoted to the main queue.
    */
   promoteDelayedJobs(): Promise<number>;
+
+  /**
+   * Retrieves real-time job counts across waiting, active, delayed, and dead-letter states.
+   *
+   * @returns Resolves to an object with counts for waiting, active, delayed, and dlq jobs.
+   */
+  getMetrics(): Promise<QueueMetrics>;
+
+  /**
+   * Pauses queue job consumption. Active jobs finish normally, but no new jobs are dequeued.
+   * Idempotent and coordinates across distributed workers using Redis.
+   */
+  pause(): Promise<void>;
+
+  /**
+   * Resumes queue job consumption.
+   * Idempotent and coordinates across distributed workers using Redis.
+   */
+  resume(): Promise<void>;
+
+  /**
+   * Returns whether the queue is currently paused.
+   *
+   * @param options Optional options or boolean indicating whether to only check local state.
+   * @returns True if the queue is paused, false otherwise.
+   */
+  isPaused(options?: { localOnly?: boolean } | boolean): Promise<boolean>;
 }
 
 /**
