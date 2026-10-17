@@ -19,6 +19,7 @@ class RetryManager {
     this.maxRetries = options.maxRetries ?? 3;
     this.baseDelay = options.baseDelay ?? 500;
     this.keyPrefix = options.keyPrefix ?? "rq";
+    this.onRetrying = options.onRetrying ?? null;
   }
 
   /**
@@ -63,6 +64,9 @@ try {
     executeAt,
     JSON.stringify(retryJob)
   );
+  if (typeof this.onRetrying === "function") {
+    this.onRetrying(retryJob, error, nextAttempt, delay);
+  }
 } catch (storageError) {
   try {
     await this.dlqManager.moveToDLQ(retryJob, storageError);

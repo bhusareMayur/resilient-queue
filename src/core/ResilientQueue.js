@@ -1,3 +1,4 @@
+const { EventEmitter } = require("events");
 const { v4: uuidv4 } = require("uuid");
 
 const RedisClient = require("../redis/RedisClient");
@@ -5,12 +6,15 @@ const IdempotencyManager = require("../managers/IdempotencyManager");
 const DLQManager = require("../managers/DLQManager");
 const RetryManager = require("../managers/RetryManager");
 const StalledJobManager = require("../managers/StalledJobManager");
+const { JobTimeoutError } = require("../errors/Errors");
 
 /**
  * Main queue class.
  */
-class ResilientQueue {
+class ResilientQueue extends EventEmitter {
   constructor(options = {}) {
+    super();
+
     const {
       redisUrl,
       redis,
@@ -26,7 +30,8 @@ class ResilientQueue {
       keyPrefix = "rq",
       stalledInterval = 15000,
       lockDuration = 30000,
-      maxStalledCount = 1
+      maxStalledCount = 1,
+      jobTimeout = null
     } = options;
 
     if (
@@ -45,6 +50,14 @@ class ResilientQueue {
       throw new Error("redisUrl or redis options are required to initialize ResilientQueue");
     }
 
+    if (jobTimeout !== undefined && jobTimeout !== null) {
+      if (typeof jobTimeout !== "number" || !Number.isFinite(jobTimeout) || jobTimeout <= 0) {
+        throw new Error("jobTimeout must be a positive number");
+      }
+    }
+
+    this.jobTimeout = jobTimeout || null;
+    this.lockDuration = lockDuration;
     this.keyPrefix = keyPrefix;
     this.mainQueueKey = `${keyPrefix}:main`;
     this.delayedQueueKey = `${keyPrefix}:delayed`;
@@ -71,13 +84,22 @@ class ResilientQueue {
 
     this.dlqManager = new DLQManager(
       this.producer,
-      keyPrefix
+      keyPrefix,
+      {
+        onDLQ: (job, reason) => this._safeEmit("dlq", job, reason)
+      }
     );
 
     this.retryManager = new RetryManager(
       this.producer,
       this.dlqManager,
-      { maxRetries, baseDelay, keyPrefix }
+      {
+        maxRetries,
+        baseDelay,
+        keyPrefix,
+        onRetrying: (job, error, attempt, delayMs) =>
+          this._safeEmit("retrying", job, error, attempt, delayMs)
+      }
     );
 
     this.stalledJobManager = new StalledJobManager(
@@ -87,20 +109,56 @@ class ResilientQueue {
         stalledInterval,
         lockDuration,
         maxStalledCount,
-        maxRetries
+        maxRetries,
+        onStalled: (job) => this._safeEmit("stalled", job),
+        onDLQ: (job, reason) => this._safeEmit("dlq", job, reason)
       }
     );
+  }
+
+  /**
+   * Safely invoke event listeners so listener exceptions or rejected promises
+   * never corrupt queue processing or trigger unhandled rejections.
+   */
+  _safeEmit(event, ...args) {
+    try {
+      const listeners = this.rawListeners(event);
+      for (const listener of listeners) {
+        try {
+          const res = listener.apply(this, args);
+          if (res && typeof res.catch === "function") {
+            res.catch((err) => {
+              if (event !== "error") {
+                this._safeEmit("error", err);
+              }
+            });
+          }
+        } catch (listenerErr) {
+          if (event !== "error") {
+            this._safeEmit("error", listenerErr);
+          }
+        }
+      }
+    } catch {
+      // Safety net to protect worker loop
+    }
   }
 
   /**
    * Validates options and creates the job descriptor.
    */
   _prepareJob(data, options = {}) {
-    const { idempotencyKey, ttlSeconds, delay, runAt } = options || {};
+    const { idempotencyKey, ttlSeconds, delay, runAt, jobTimeout } = options || {};
 
     if (ttlSeconds !== undefined && ttlSeconds !== null) {
       if (typeof ttlSeconds !== "number" || !Number.isInteger(ttlSeconds)) {
         throw new Error("ttlSeconds must be an integer");
+      }
+    }
+
+    if (jobTimeout !== undefined && jobTimeout !== null) {
+      if (typeof jobTimeout !== "number" || !Number.isFinite(jobTimeout) || jobTimeout <= 0) {
+        throw new Error("jobTimeout must be a positive number");
       }
     }
 
@@ -143,6 +201,10 @@ class ResilientQueue {
       ttlSeconds: ttlSeconds ?? null,
       createdAt: Date.now()
     };
+
+    if (jobTimeout !== undefined && jobTimeout !== null) {
+      job.jobTimeout = jobTimeout;
+    }
 
     if (delay !== undefined && delay !== null) {
       job.delay = delay;
@@ -313,10 +375,16 @@ class ResilientQueue {
       throw new Error("A handler function must be provided to process()");
     }
 
-    const { concurrency = 1 } = options;
+    const { concurrency = 1, jobTimeout = null } = options;
 
     if (!Number.isInteger(concurrency) || concurrency < 1) {
       throw new Error("Concurrency must be a positive integer");
+    }
+
+    if (jobTimeout !== undefined && jobTimeout !== null) {
+      if (typeof jobTimeout !== "number" || !Number.isFinite(jobTimeout) || jobTimeout <= 0) {
+        throw new Error("jobTimeout must be a positive number");
+      }
     }
 
     if (this.isRunning) {
@@ -400,7 +468,7 @@ class ResilientQueue {
     // Check stalled jobs immediately on startup to recover any crashed worker jobs.
     this.stalledScheduler = setTimeout(promoteStalled, 0);
 
-    const executeJob = async (job) => {
+    const executeJob = async (job, abortController) => {
       let shouldProceed = true;
 
       // Apply idempotency only on the first attempt if it hasn't stalled.
@@ -417,14 +485,94 @@ class ResilientQueue {
         return;
       }
 
+      const timeoutMs =
+        job.jobTimeout ??
+        options.jobTimeout ??
+        this.jobTimeout ??
+        null;
+
+      let completedEmitted = false;
+      let failedEmitted = false;
+
+      if (!timeoutMs || timeoutMs <= 0) {
+        try {
+          const result = await handler(job);
+          if (!job.isLeaseLost && !completedEmitted) {
+            completedEmitted = true;
+            this._safeEmit("completed", job, result);
+          }
+        } catch (error) {
+          if (!job.isLeaseLost && !failedEmitted) {
+            failedEmitted = true;
+            this._safeEmit("failed", job, error);
+            await this.retryManager.handleFailure(job, error);
+          }
+        }
+        return;
+      }
+
+      let timeoutTimer = null;
+      let timedOut = false;
+      job.isTimedOut = false;
+
+      let handlerPromise;
       try {
-        await handler(job);
+        handlerPromise = Promise.resolve().then(() => handler(job));
+      } catch (syncError) {
+        handlerPromise = Promise.reject(syncError);
+      }
+
+      // Prevent unhandled rejections on late handler rejection
+      handlerPromise.catch(() => {});
+
+      const timeoutPromise = new Promise((_, reject) => {
+        timeoutTimer = setTimeout(() => {
+          timedOut = true;
+          job.isTimedOut = true;
+          const timeoutErr = new JobTimeoutError(
+            `Job execution timed out after ${timeoutMs}ms`,
+            timeoutMs
+          );
+          if (abortController && !abortController.signal.aborted) {
+            abortController.abort(timeoutErr);
+          }
+          reject(timeoutErr);
+        }, timeoutMs);
+      });
+
+      try {
+        const result = await Promise.race([handlerPromise, timeoutPromise]);
+        if (!job.isLeaseLost && !timedOut && !completedEmitted) {
+          completedEmitted = true;
+          this._safeEmit("completed", job, result);
+        }
       } catch (error) {
-        // If the lease was lost while handler was running, the recovery scheduler
-        // already re-queued or dead-lettered this job. Do not duplicate failure handling.
+        if (!job.isLeaseLost && !failedEmitted) {
+          failedEmitted = true;
+          this._safeEmit("failed", job, error);
+        }
+
+        if (timedOut) {
+          // Safe wait for late handler settlement bounded by lock duration
+          // before scheduling retry or releasing lock, preventing concurrent
+          // execution with retried job instances and premature lock expiration.
+          const maxWaitMs = this.lockDuration || 30000;
+          await Promise.race([
+            handlerPromise,
+            new Promise((resolve) => setTimeout(resolve, maxWaitMs))
+          ]).catch(() => {});
+        }
+
         if (!job.isLeaseLost) {
           await this.retryManager.handleFailure(job, error);
         }
+      } finally {
+        if (timeoutTimer) {
+          clearTimeout(timeoutTimer);
+          timeoutTimer = null;
+        }
+
+        this.stalledJobManager.stopHeartbeat(job.id);
       }
     };
 
@@ -498,7 +646,7 @@ class ResilientQueue {
           let jobPromise;
           jobPromise = (async () => {
             try {
-              await executeJob(job);
+              await executeJob(job, abortController);
             } catch (error) {
               if (this.isRunning) {
                 console.error("Worker encountered an error:", error);

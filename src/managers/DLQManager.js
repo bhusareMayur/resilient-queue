@@ -234,13 +234,21 @@ const PURGE_SCRIPT = `
  * Handles Dead Letter Queue (DLQ) operations.
  */
 class DLQManager {
-  constructor(redisClient, keyPrefix = "rq") {
+  constructor(redisClient, keyPrefix = "rq", options = {}) {
     if (!redisClient) {
       throw new Error("Redis client is required for DLQManager");
     }
 
+    let prefix = keyPrefix;
+    let opts = options;
+    if (typeof keyPrefix === "object" && keyPrefix !== null) {
+      opts = keyPrefix;
+      prefix = opts.keyPrefix || "rq";
+    }
+
     this.redis = redisClient;
-    this.keyPrefix = keyPrefix;
+    this.keyPrefix = prefix;
+    this.onDLQ = opts?.onDLQ || null;
     this.dlqKey = `${this.keyPrefix}:dlq`;
     this.mainQueueKey = `${this.keyPrefix}:main`;
     this.stalledMetaKey = `${this.keyPrefix}:stalled_meta`;
@@ -253,10 +261,14 @@ class DLQManager {
     const failedJob = {
       ...job,
       failedAt: Date.now(),
-      failureReason: reason?.message || "Unknown error"
+      failureReason: reason?.message || (typeof reason === "string" ? reason : "Unknown error")
     };
 
     await this.redis.rpush(this.dlqKey, JSON.stringify(failedJob));
+
+    if (typeof this.onDLQ === "function") {
+      this.onDLQ(failedJob, reason);
+    }
   }
 
   /**

@@ -17,6 +17,8 @@ Built for resilience, **`@mayurbhusare/resilient-queue`** provides crash-durable
 
 - **Crash-Proof Job Durability**: Uses atomic `BLMOVE` (with `BRPOPLPUSH` fallback) to move active jobs to `rq:active`. In-flight jobs are never deleted from Redis during processing. If a worker crashes, an active visibility heartbeat detects the abandoned job and safely recovers it.
 - **Fencing Tokens & Lease Revocation**: Per-dequeue fencing tokens (`lockToken`) protect against stale workers renewing or releasing successor workers' locks. Lease loss is surfaced to handlers via `job.signal` (`AbortSignal`) and `job.isLeaseLost`.
+- **Event Emitter Observability**: Native Node.js `EventEmitter` lifecycle hooks (`completed`, `failed`, `retrying`, `dlq`, `stalled`) with safe listener isolation, duplicate prevention, and zero queue corruption.
+- **Job Execution Timeouts**: Optional execution timeout (`jobTimeout`) with cooperative cancellation via `AbortSignal`, `JobTimeoutError`, automatic retry/DLQ pipeline routing, and safe lock retention.
 - **Scheduled Delayed Jobs**: Schedule jobs directly from `enqueue()` using `{ delay: ms }` or `{ runAt: new Date(...) }` backed by Redis sorted sets (`rq:delayed`) and atomic Lua promotion.
 - **High-Throughput Batch Enqueuing (`enqueueMany`)**: Enqueue thousands of jobs in a single network round-trip using an `ioredis` pipeline for 50x–100x throughput boost.
 - **Crash-Durable Retries**: Scheduled retries are persisted in a Redis Sorted Set (`rq:delayed`) and promoted via atomic Lua scripts, surviving worker restarts and server reboots.
@@ -119,6 +121,77 @@ main().catch(console.error);
 ```
 
 For more detailed workflows, see the [Getting Started Guide](./docs/getting-started.md) and [Code Examples](./docs/examples.md).
+
+---
+
+## Event Emitter Observability
+
+`ResilientQueue` extends Node.js's native `EventEmitter`, exposing typed lifecycle hooks for real-time telemetry, APM metrics, logging, and monitoring:
+
+```javascript
+// Job completed successfully
+queue.on("completed", (job, result) => {
+  console.log(`[Job ${job.id}] Completed with result:`, result);
+});
+
+// Execution attempt failed
+queue.on("failed", (job, error) => {
+  console.warn(`[Job ${job.id}] Attempt ${job.attempt} failed: ${error.message}`);
+});
+
+// Retry scheduled with exponential backoff
+queue.on("retrying", (job, error, attempt, delayMs) => {
+  console.log(`[Job ${job.id}] Scheduled retry #${attempt} in ${delayMs}ms`);
+});
+
+// Job moved to Dead-Letter Queue
+queue.on("dlq", (job, reason) => {
+  console.error(`[Job ${job.id}] Moved to DLQ. Reason:`, reason?.message || reason);
+});
+
+// Stalled job recovered from a crashed worker
+queue.on("stalled", (job) => {
+  console.warn(`[Job ${job.id}] Stalled job recovered to main queue (stalledCount: ${job.stalledCount})`);
+});
+```
+
+> [!NOTE]
+> Event listener execution is safely isolated. If a listener throws a synchronous exception or returns a rejected promise, the error is caught safely without interrupting queue processing, corrupting state, or causing unhandled promise rejections.
+
+---
+
+## Job Execution Timeouts & Cancellation
+
+Configure an optional execution timeout in milliseconds at the **queue level**, **worker level**, or **per-job**:
+
+```javascript
+const { ResilientQueue, JobTimeoutError } = require("@mayurbhusare/resilient-queue");
+
+// 1. Queue-level default timeout (5 seconds)
+const queue = new ResilientQueue({
+  redisUrl: "redis://127.0.0.1:6379",
+  jobTimeout: 5000
+});
+
+// 2. Worker-level override (3 seconds)
+queue.process(async (job) => {
+  // Cooperative cancellation via standard AbortSignal
+  const response = await fetch("https://api.example.com/sync", {
+    signal: job.signal
+  });
+  return response.json();
+}, { concurrency: 2, jobTimeout: 3000 });
+
+// 3. Per-job override (1 second)
+await queue.enqueue({ orderId: 101 }, { jobTimeout: 1000 });
+```
+
+### Timeout Characteristics
+
+- **Cooperative Cancellation via `AbortSignal`**: When a timeout triggers, `job.signal` is aborted with a `JobTimeoutError`. Pass `job.signal` to compatible APIs (e.g., `fetch`, child processes, database drivers) to cancel ongoing I/O immediately.
+- **Retry & DLQ Pipeline Integration**: `JobTimeoutError` extends `RetryableError`. Timed-out jobs are automatically retried with exponential backoff up to `maxRetries` before routing to the DLQ.
+- **Lock Safety & Race Protection**: The visibility lock in Redis is held safely until the worker handler settles, preventing another worker from executing the job concurrently due to unsafe premature lock release. Late handler resolutions and rejections are ignored safely without marking the timed-out job as completed or triggering unhandled rejections.
+- **Zero Overhead When Disabled**: When `jobTimeout` is omitted or set to `null`, timeouts are disabled and exact legacy execution semantics are preserved.
 
 ---
 
