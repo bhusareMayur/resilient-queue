@@ -2,6 +2,32 @@ import { EventEmitter } from "events";
 import type { Redis, Cluster, RedisOptions, ClusterOptions, ClusterNode } from "ioredis";
 
 /**
+ * Lifecycle states of a job.
+ */
+export type JobState = "waiting" | "active" | "delayed" | "completed" | "failed";
+
+/**
+ * Retention policy configuration for completed or failed jobs.
+ */
+export interface RetentionPolicy {
+  /**
+   * Maximum age in seconds before the job hash is automatically removed.
+   */
+  age?: number;
+
+  /**
+   * Maximum number of jobs to retain (older jobs are trimmed).
+   */
+  count?: number;
+}
+
+/**
+ * Retention option: boolean (true = remove immediately, false = keep indefinitely),
+ * number (max count to keep), or RetentionPolicy object ({ age, count }).
+ */
+export type RetentionOption = boolean | number | RetentionPolicy;
+
+/**
  * Represents a queued job.
  */
 export interface Job<T = any> {
@@ -19,6 +45,63 @@ export interface Job<T = any> {
    * The number of retry attempts executed so far (starts at 0 on initial try).
    */
   attempt: number;
+
+  /**
+   * Current lifecycle state of the job ("waiting" | "active" | "delayed" | "completed" | "failed").
+   */
+  state?: JobState;
+
+  /**
+   * Current execution progress percentage (0–100).
+   */
+  progress?: number;
+
+  /**
+   * Result or return value from successful job completion.
+   */
+  result?: any;
+
+  /**
+   * Alias for result.
+   */
+  returnValue?: any;
+
+  /**
+   * Diagnostic reason or error message describing why the job failed.
+   */
+  failureReason?: string;
+
+  /**
+   * Unix timestamp (in milliseconds) when the job execution started.
+   */
+  startedAt?: number;
+
+  /**
+   * Unix timestamp (in milliseconds) when the job finished successfully.
+   */
+  completedAt?: number;
+
+  /**
+   * Unix timestamp (in milliseconds) when the job failed.
+   */
+  failedAt?: number;
+
+  /**
+   * Retention policy for when the job completes successfully.
+   */
+  removeOnComplete?: RetentionOption;
+
+  /**
+   * Retention policy for when the job fails.
+   */
+  removeOnFail?: RetentionOption;
+
+  /**
+   * Updates the job's progress in Redis (0–100) and emits a "progress" event on the queue.
+   *
+   * @param progress Progress percentage between 0 and 100.
+   */
+  updateProgress?: (progress: number) => Promise<void>;
 
   /**
    * Optional idempotency key supplied during enqueue.
@@ -325,6 +408,16 @@ export interface QueueOptions {
    * @default 50
    */
   pausePollInterval?: number;
+
+  /**
+   * Default retention policy for completed jobs (true to remove immediately, count number, or { age, count } object).
+   */
+  removeOnComplete?: RetentionOption;
+
+  /**
+   * Default retention policy for failed jobs (true to remove immediately, count number, or { age, count } object).
+   */
+  removeOnFail?: RetentionOption;
 }
 
 /**
@@ -410,6 +503,16 @@ export interface EnqueueOptions {
    * Per-job jitter flag overriding worker and queue defaults.
    */
   jitter?: boolean;
+
+  /**
+   * Retention policy for when this job completes successfully (overrides queue default).
+   */
+  removeOnComplete?: RetentionOption;
+
+  /**
+   * Retention policy for when this job fails (overrides queue default).
+   */
+  removeOnFail?: RetentionOption;
 }
 
 /**
@@ -599,6 +702,11 @@ export interface ResilientQueueEvents<T = any> {
   stalled: (job: Job<T>) => void;
 
   /**
+   * Emitted when a job's execution progress is updated.
+   */
+  progress: (job: Job<T>, progress: number) => void;
+
+  /**
    * Emitted when an error is encountered in an event listener.
    */
   error: (error: Error) => void;
@@ -780,6 +888,15 @@ export class ResilientQueue extends EventEmitter {
    * @returns True if the queue is paused, false otherwise.
    */
   isPaused(options?: { localOnly?: boolean } | boolean): Promise<boolean>;
+
+  /**
+   * Retrieves persisted job details from Redis by ID.
+   * Returns null when the job is missing or expired according to retention policy.
+   *
+   * @param id Unique identifier of the job.
+   * @returns Resolves to the Job descriptor or null if not found.
+   */
+  getJob<T = any>(id: string): Promise<Job<T> | null>;
 }
 
 /**
