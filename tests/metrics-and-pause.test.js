@@ -247,6 +247,7 @@ describe("Distributed Pause and Resume", () => {
   let queue;
   let redis;
   const keyPrefix = "rq:test:pause";
+  let extraQueues = [];
 
   beforeAll(async () => {
     redis = new Redis(redisUrl);
@@ -254,6 +255,7 @@ describe("Distributed Pause and Resume", () => {
 
   beforeEach(async () => {
     await redis.flushall();
+    extraQueues = [];
     queue = new ResilientQueue({
       redisUrl,
       keyPrefix,
@@ -267,6 +269,12 @@ describe("Distributed Pause and Resume", () => {
     if (queue) {
       await queue.close();
       queue = null;
+    }
+    while (extraQueues.length > 0) {
+      const q = extraQueues.pop();
+      try {
+        await q.close();
+      } catch {}
     }
   });
 
@@ -445,12 +453,14 @@ describe("Distributed Pause and Resume", () => {
       keyPrefix,
       pausePollInterval: 25
     });
+    extraQueues.push(queue1);
 
     const queue2 = new ResilientQueue({
       redisUrl,
       keyPrefix,
       pausePollInterval: 25
     });
+    extraQueues.push(queue2);
 
     const queue2Processed = [];
     const queue2PausedEvents = [];
@@ -492,6 +502,12 @@ describe("Distributed Pause and Resume", () => {
     // 5. Queue 2 should promptly resume and process both waiting jobs
     await waitForCondition(() => queue2Processed.length === 3, 3000);
     expect(queue2Processed.sort()).toEqual([1, 2, 3]);
+
+    // Wait for the active execution lease and cleanup to finish settling in Redis
+    await waitForCondition(async () => {
+      const m = await queue2.getMetrics();
+      return m.waiting === 0 && m.active === 0;
+    }, 4000);
 
     const metricsAfterResume = await queue2.getMetrics();
     expect(metricsAfterResume.waiting).toBe(0);
@@ -603,6 +619,7 @@ describe("Distributed Pause and Resume", () => {
       redisUrl,
       keyPrefix: "rq:test:producer-only"
     });
+    extraQueues.push(producerOnlyQueue);
 
     expect(await producerOnlyQueue.isPaused()).toBe(false);
 
@@ -654,6 +671,7 @@ describe("Distributed Pause and Resume", () => {
       redisUrl,
       keyPrefix: clusterPrefix
     });
+    extraQueues.push(clusterQueue);
 
     try {
       const mainSlot = calculateSlot(clusterQueue.mainQueueKey);
@@ -677,18 +695,21 @@ describe("Distributed Pause and Resume", () => {
       keyPrefix: "rq:test:default-poll",
       pausePollInterval: -10
     });
+    extraQueues.push(defaultQueue);
 
     const nanQueue = new ResilientQueue({
       redisUrl,
       keyPrefix: "rq:test:nan-poll",
       pausePollInterval: "not-a-number"
     });
+    extraQueues.push(nanQueue);
 
     const customQueue = new ResilientQueue({
       redisUrl,
       keyPrefix: "rq:test:custom-poll",
       pausePollInterval: 123
     });
+    extraQueues.push(customQueue);
 
     expect(defaultQueue._pausePollInterval).toBe(50);
     expect(nanQueue._pausePollInterval).toBe(50);
