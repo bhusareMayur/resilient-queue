@@ -4,7 +4,7 @@
 [![status](https://img.shields.io/badge/status-actively%20maintained-brightgreen?style=flat-square)](https://github.com/resilient-queue/resilient-queue)
 [![production ready](https://img.shields.io/badge/production-ready-blue?style=flat-square)](https://github.com/resilient-queue/resilient-queue)
 [![license](https://img.shields.io/npm/l/@mayurbhusare/resilient-queue?style=flat-square&color=blue)](./LICENSE)
-[![tests](https://img.shields.io/badge/tests-164%20passed-brightgreen?style=flat-square)](https://github.com/resilient-queue/resilient-queue)
+[![tests](https://img.shields.io/badge/tests-194%20passed-brightgreen?style=flat-square)](https://github.com/resilient-queue/resilient-queue)
 
 A lightweight, production-grade, Redis-backed job queue for Node.js.
 
@@ -14,6 +14,9 @@ Built for resilience, **`@mayurbhusare/resilient-queue`** provides crash-durable
 
 ## Features
 
+- **Job State Persistence & `getJob()`**: Persist job lifecycle states (`waiting`, `active`, `delayed`, `completed`, `failed`), execution timing, return values, and failure diagnostics in Redis hashes (`rq:job:<id>`) queryable via `queue.getJob(id)`.
+- **Real-Time Job Progress Tracking**: Asynchronously report and stream job progress during worker execution via `job.updateProgress(progress)` or `queue.updateJobProgress(id, progress)` with automatic `progress` lifecycle events.
+- **Configurable Job Retention Policies**: Automatic cleanup and lifecycle pruning of completed and failed jobs with boolean (`removeOnComplete`, `removeOnFail`), count-based (`count`), or TTL age-based (`age`) retention policies.
 - **Crash-Proof Job Durability**: Uses atomic `BLMOVE` (with `BRPOPLPUSH` fallback) to move active jobs to `rq:active`. In-flight jobs are never deleted from Redis during processing. If a worker crashes, an active visibility heartbeat detects the abandoned job and safely recovers it.
 - **Real-Time Queue Metrics**: Inspect job counts across waiting, active, delayed, and dead-letter queue states (`getMetrics()`) in a single network round-trip using an `ioredis` pipeline.
 - **Distributed Pause & Resume**: Pause and resume job consumption locally and across distributed worker processes with atomic Redis coordination (`pause()`, `resume()`, `isPaused()`), active-job draining, and idempotent state transitions.
@@ -357,6 +360,77 @@ await queue.resume();
 
 ---
 
+## Job State, Progress Tracking & Retention Policies
+
+`ResilientQueue` provides first-class job state persistence, real-time progress updates, and configurable retention cleanup policies:
+
+### Inspecting Job State with `queue.getJob(id)`
+
+Every enqueued job creates an associated persistent record in Redis (`<keyPrefix>:job:<id>`). You can inspect live progress, execution timestamps, return values, and failure reasons at any point:
+
+```javascript
+const job = await queue.getJob(jobId);
+
+if (job) {
+  console.log(`Job ${job.id} state: ${job.state}`); // "waiting" | "active" | "delayed" | "completed" | "failed"
+  console.log(`Progress: ${job.progress}%`);
+  console.log("Payload:", job.data);
+  console.log("Return value:", job.result || job.returnValue);
+  console.log("Failure reason:", job.failureReason);
+}
+```
+
+### Reporting Real-Time Progress
+
+Workers can report progress during execution using `job.updateProgress(progress)`. Progress can be a percentage number (`0` to `100`) or an arbitrary metadata object:
+
+```javascript
+queue.process(async (job) => {
+  await job.updateProgress(25);
+  // Perform step 1...
+
+  await job.updateProgress(75);
+  // Perform step 2...
+
+  await job.updateProgress(100);
+  return { status: "processed" };
+});
+
+// Listen for progress updates across instances
+queue.on("progress", (job, progress) => {
+  console.log(`[Job ${job.id}] Progress update:`, progress);
+});
+```
+
+### Configurable Retention Policies
+
+Control how completed and failed job records are retained in Redis to manage memory effectively:
+
+```javascript
+// 1. Queue-level retention defaults
+const queue = new ResilientQueue({
+  redisUrl: "redis://127.0.0.1:6379",
+  removeOnComplete: { count: 1000, age: 86400 }, // Keep max 1,000 completed jobs up to 24 hours
+  removeOnFail: { age: 604800 }                  // Keep failed jobs for 7 days
+});
+
+// 2. Per-job retention overrides
+await queue.enqueue({ reportId: "annual-2026" }, {
+  removeOnComplete: true, // Delete immediately upon successful completion
+  removeOnFail: 50        // Retain the last 50 failed attempts
+});
+```
+
+#### Retention Policy Options
+
+- **`true`**: Immediately removes the job record upon settling.
+- **`false`**: Retains the job record indefinitely (default).
+- **`number`**: Caps retention to the `N` most recent jobs using Redis Sorted Sets (`rq:completed`, `rq:failed`).
+- **`{ age: seconds }`**: Sets a Redis TTL (in seconds) on the job key.
+- **`{ count: N, age: seconds }`**: Combines count capping with TTL expiration.
+
+---
+
 ## Architecture Overview
 
 ```mermaid
@@ -407,6 +481,9 @@ All keys are namespaced by the configured `keyPrefix` (default: `"rq"`):
 | `<keyPrefix>:dlq` | `List` | Dead-Letter Queue storing exhausted, fatal, or poison pill failed jobs with failure metadata. |
 | `<keyPrefix>:idempotency:<key>` | `String` | Idempotency key mapping to registered candidate job ID with optional TTL expiration (`EX`). |
 | `<keyPrefix>:paused` | `String` | Shared pause flag (`"1"`) coordinating pause state across distributed workers. |
+| `<keyPrefix>:job:<id>` | `Hash` | Persistent job state record, execution timestamps, progress, return values, and failure diagnostics. |
+| `<keyPrefix>:completed` | `Sorted Set` | Index of completed job IDs ordered by completion timestamp for count-based retention pruning. |
+| `<keyPrefix>:failed` | `Sorted Set` | Index of failed job IDs ordered by failure timestamp for count-based retention pruning. |
 
 ---
 

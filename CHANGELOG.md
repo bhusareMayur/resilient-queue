@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [2.2.0] - 2026-10-20
+
+### Added
+- **Job State Persistence & `getJob()`**: Persist job lifecycle states (`waiting`, `active`, `delayed`, `completed`, `failed`) and complete execution records in Redis (`rq:job:<id>`). Inspect live and past job states, return values, failure reasons, and execution metadata via `queue.getJob(jobId)`.
+- **Real-Time Job Progress Tracking**: Report progress during job execution via `job.updateProgress(progress)` inside worker handlers or `queue.updateJobProgress(jobId, progress)`. Supports numeric progress percentages (0–100) or structured metadata objects with automatic `progress` event emission across listeners.
+- **Configurable Job Retention Policies**: Added granular retention policies via `removeOnComplete` and `removeOnFail` configurable at queue initialization or per-job enqueuing:
+  - Boolean: `true` for immediate removal on completion/failure; `false` to retain indefinitely.
+  - Count-based retention: Retain the last `N` completed/failed jobs using Redis Sorted Sets (`rq:completed`, `rq:failed`).
+  - Age-based retention: Automatically expire job records after a configured TTL in seconds (`{ age: seconds }` or combined `{ count: N, age: seconds }`).
+- **`progress` Lifecycle Event**: Added `queue.on("progress", (job, progress) => { ... })` lifecycle event with safe listener error boundary protection.
+- **TypeScript Type Definitions**: Complete TypeScript typings in `index.d.ts` for `JobState`, `JobProgress`, `RetentionOption`, `RetentionPolicy`, `getJob()`, and `job.updateProgress()`.
+
+### Fixed
+- **Test Suite Stability**: Resolved active metric race conditions and connection leaks in metrics and pause test suites (`tests/metrics-and-pause.test.js`).
+
+---
+
 ## [2.0.2] - 2026-10-17
 
 ### Changed

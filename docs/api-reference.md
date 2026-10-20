@@ -13,6 +13,7 @@ This document provides a comprehensive reference for all exported classes, metho
   - [queue.process(handler, [options])](#queueprocesshandler-options)
   - [queue.stop()](#queuestop)
   - [queue.close()](#queueclose)
+  - [queue.getJob(id)](#queuegetjobid)
   - [queue.getJobMetadata(jobId)](#queuegetjobmetadatajobid)
   - [queue.getDLQ([options])](#queuegetdlqoptions)
   - [queue.getDLQCount()](#queuegetdlqcount)
@@ -305,6 +306,41 @@ Calls `queue.stop()` to settle active jobs and then gracefully closes queue-owne
 
 ```javascript
 await queue.close();
+```
+
+---
+
+### `queue.getJob(id)`
+
+Retrieves persisted job state details from Redis (`<keyPrefix>:job:<id>`). Returns `null` when the job does not exist or has expired according to its retention policy.
+
+#### Parameters
+
+- `id` (`string`): The unique UUID of the job.
+
+#### Returns
+
+- `Promise<Job<T> | null>`: A job descriptor object containing:
+  - `id` (`string`): Unique job identifier.
+  - `data` (`T`): Original user-provided payload.
+  - `state` (`JobState`): Current lifecycle state (`"waiting" | "active" | "delayed" | "completed" | "failed"`).
+  - `attempt` (`number`): Number of retry attempts executed so far.
+  - `progress` (`number | object`): Current execution progress value.
+  - `result` (`any`, optional): Return value if completed.
+  - `failureReason` (`string`, optional): Error message or diagnostic if failed.
+  - `createdAt` (`number`): Enqueue timestamp (ms).
+  - `startedAt` (`number`, optional): Execution start timestamp (ms).
+  - `completedAt` (`number`, optional): Completion timestamp (ms).
+  - `failedAt` (`number`, optional): Failure timestamp (ms).
+  - Returns `null` if the job is not found or has been pruned.
+
+#### Example
+
+```javascript
+const job = await queue.getJob("550e8400-e29b-41d4-a716-446655440000");
+if (job) {
+  console.log(`Job state: ${job.state}, progress: ${job.progress}%`);
+}
 ```
 
 ---
@@ -1120,3 +1156,6 @@ All Redis keys are namespaced with the configured `keyPrefix` (default: `"rq"`):
 | `<keyPrefix>:dlq` | `List` | Dead-Letter Queue storing permanently failed jobs with diagnostics. |
 | `<keyPrefix>:idempotency:<key>` | `String` | Idempotency key mapping to registered job ID with optional TTL. |
 | `<keyPrefix>:paused` | `String` | Shared pause flag (`"1"`) coordinating pause state across distributed workers. |
+| `<keyPrefix>:job:<id>` | `Hash` | Persistent job state record, execution timestamps, progress, return values, and failure diagnostics. |
+| `<keyPrefix>:completed` | `Sorted Set` | Index of completed job IDs ordered by completion timestamp for count-based retention pruning. |
+| `<keyPrefix>:failed` | `Sorted Set` | Index of failed job IDs ordered by failure timestamp for count-based retention pruning. |
